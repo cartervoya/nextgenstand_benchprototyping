@@ -119,11 +119,24 @@ no longer where you left them. Press `Z` to re-apply the safe state.
 
 ```powershell
 .\.venv\Scripts\ngs.exe bench          # live dashboard, 2 Hz
-.\.venv\Scripts\ngs.exe bench --sim    # same thing with no board attached
+.\.venv\Scripts\ngs.exe web            # the same dashboard in a browser window
+.\.venv\Scripts\ngs.exe bench --sim    # either one with no board attached
 .\.venv\Scripts\ngs.exe send "V1O;P50;"
 .\.venv\Scripts\ngs.exe ports          # find attached Teensys
 .\.venv\Scripts\ngs.exe check          # bring-up check, read-only
+.\.venv\Scripts\ngs.exe selftest       # verify the board before wiring it up
 ```
+
+Only one process can hold a serial port on Windows, so the terminal dashboard,
+the web dashboard and the one-shot commands cannot run at the same time. Quit
+one before starting another.
+
+### In a separate window
+
+`ngs web` serves the dashboard at `http://127.0.0.1:8765/` and opens a browser
+— pop it out, put it on a second monitor, leave it up while you work in the
+terminal. Same bench, same command language, same 2 Hz poll; it binds to
+localhost only, because it drives real hardware.
 
 `--sim` works on every command. It swaps the serial port for a simulated
 device with a crude flow model behind it, which is how the UI gets exercised

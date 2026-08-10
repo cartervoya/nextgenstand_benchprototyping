@@ -189,6 +189,12 @@ class Device:
                         "firmware? Try: pio run -t upload"
                     ) from None
 
+    @property
+    def port(self) -> str | None:
+        """The port name, when the transport has one. `None` for a simulated
+        device -- which is exactly the distinction a UI wants to display."""
+        return getattr(self._t, "port", None)
+
     def close(self) -> None:
         self._t.close()
 

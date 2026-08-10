@@ -46,7 +46,9 @@ def _open(port: str | None, sim: bool, timeout: float = 1.0) -> tuple[Bench, str
         device = Device.open(port, timeout=timeout)
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from None
-    return Bench(device), port or "auto"
+    # The resolved port, not "auto": which board you are actually talking to is
+    # the whole point of the label once a second one shows up on the bench.
+    return Bench(device), device.port or "?"
 
 
 def _run(bench: Bench, line: str) -> None:
@@ -293,6 +295,95 @@ def _exercise_outputs(obj: Bench) -> bool:
         obj.stop()
 
     return ok
+
+
+@app.command()
+def selftest(
+    pings: Annotated[int, typer.Option(help="Round trips in the link soak.")] = 500,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+) -> None:
+    """Verify the board itself, before it is wired to anything.
+
+    Drives the valve pins and the pump pin to check the silicon does what the
+    firmware claims. Safe with nothing connected; once the board is wired,
+    these same writes move real hardware.
+    """
+    from .selftest import run
+
+    obj, label = _open(port, sim)
+    console.print(f"[dim]running against {label} -- this takes a few seconds[/dim]\n")
+
+    with obj.device:
+        report = run(obj, pings=pings)
+
+    width = max(len(c.name) for c in report.checks)
+    for check in report.checks:
+        if not check.ok:
+            mark, style = "FAIL", "bold red"
+        elif check.caveat:
+            mark, style = "note", "yellow"
+        else:
+            mark, style = " ok ", "green"
+        console.print(f"[{style}]{mark}[/{style}]  {check.name.ljust(width)}  {check.detail}")
+
+    if report.ok:
+        console.print("\n[green]the board is behaving correctly[/green]")
+    else:
+        console.print("\n[red]something is wrong -- see the failures above[/red]")
+        raise typer.Exit(1)
+
+
+@app.command()
+def web(
+    http_port: Annotated[int, typer.Option("--http-port", help="Port to serve on.")] = 8765,
+    no_browser: Annotated[
+        bool, typer.Option("--no-browser", help="Do not open a browser.")
+    ] = False,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+    timeout: TimeoutOpt = 1.0,
+) -> None:
+    """Serve the dashboard as a local web page, for a separate window.
+
+    Same bench and same commands as `ngs bench`, in a browser instead of a
+    terminal. Binds to localhost only -- this drives hardware.
+    """
+    import webbrowser
+
+    from .web import WebBench, serve
+
+    obj, label = _open(port, sim, timeout)
+    url = f"http://127.0.0.1:{http_port}/"
+
+    with obj.device:
+        obj.initialize()
+        state = WebBench(obj, label)
+        try:
+            state.fw = obj.device.info().fw_version
+        except Exception as exc:  # noqa: BLE001 -- the page just shows "?"
+            console.print(f"[yellow]could not read device info: {exc}[/yellow]")
+
+        try:
+            server = serve(state, http_port)
+        except OSError as exc:
+            raise typer.BadParameter(
+                f"cannot listen on {url} ({exc}). Another instance running? "
+                "Pass --http-port to pick a different one."
+            ) from None
+
+        console.print(f"dashboard at [bold]{url}[/bold]   (Ctrl-C to stop)")
+        if not no_browser:
+            webbrowser.open(url)
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            console.print("\nstopping")
+        finally:
+            server.server_close()
+            # Never leave the pump running because a browser tab was closed.
+            obj.stop()
 
 
 @app.command()
