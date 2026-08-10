@@ -198,6 +198,98 @@ def test_timeout_names_the_command():
         dev.ping()
 
 
+class DropsEarlyResponses:
+    """A link that swallows its first few replies.
+
+    What a Teensy actually does right after the port opens: until Windows
+    finishes the CDC handshake the firmware sees `!Serial`, drops whatever it
+    was about to send, and the host waits out a full timeout for a reply that
+    was discarded rather than delayed.
+    """
+
+    def __init__(self, inner: FakeDevice, drops: int) -> None:
+        self.inner = inner
+        self.drops = drops
+
+    def write(self, data: bytes) -> int:
+        self.inner.write(data)
+        if self.drops:
+            self.inner._tx.clear()
+            self.drops -= 1
+        return len(data)
+
+    def read(self, size: int = 1) -> bytes:
+        return self.inner.read(size)
+
+    @property
+    def in_waiting(self) -> int:
+        return self.inner.in_waiting
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+def test_wait_ready_retries_until_the_link_comes_up(board):
+    dev = Device(DropsEarlyResponses(FakeDevice(board), drops=2), timeout=0.1)
+    dev.wait_ready(timeout=3.0)
+    assert dev.ping().uptime_us >= 0  # usable immediately afterwards
+
+
+def test_wait_ready_gives_up_with_an_actionable_message():
+    dev = Device(SilentTransport())
+    with pytest.raises(Timeout, match="pio run -t upload"):
+        dev.wait_ready(timeout=0.3)
+
+
+class RecordingReads:
+    """Records the sizes passed to read(), like pyserial would see them."""
+
+    def __init__(self, waiting: int = 0) -> None:
+        self.waiting = waiting
+        self.sizes: list[int] = []
+
+    @property
+    def in_waiting(self) -> int:
+        return self.waiting
+
+    def read(self, size: int = 1) -> bytes:
+        self.sizes.append(size)
+        return b""
+
+    def write(self, data: bytes) -> int:
+        return len(data)
+
+    def close(self) -> None:
+        pass
+
+
+def test_reads_only_what_is_waiting():
+    """pyserial's read(n) blocks until it has n bytes or the timeout expires.
+    Asking for a big buffer to "read whatever is available" therefore pays the
+    full timeout on every response -- 20 ms per command, measured on hardware.
+    """
+    transport = RecordingReads(waiting=12)
+    Device(transport)._read_available()
+    assert transport.sizes == [12]
+
+
+def test_falls_back_to_a_single_byte_when_nothing_is_waiting():
+    """read(1) returns the moment the first byte lands; the decoder is
+    incremental, so a partial frame costs nothing."""
+    transport = RecordingReads(waiting=0)
+    Device(transport)._read_available()
+    assert transport.sizes == [1]
+
+
+def test_a_transport_without_in_waiting_still_works(board):
+    """Not everything is pyserial -- the fallback must not require it."""
+
+    class NoInWaiting(SilentTransport):
+        pass
+
+    assert Device(NoInWaiting())._read_available() == b""
+
+
 def test_a_stale_response_does_not_satisfy_the_next_request(board):
     """A response to a request that already timed out must be discarded, not
     handed to whatever is waiting now."""

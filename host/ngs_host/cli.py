@@ -21,6 +21,7 @@ from rich.table import Table
 from .bench import BENCH_CONFIG, Bench
 from .commands import execute_line
 from .device import Device, find_ports
+from .keyboard import stdin_is_interactive
 from .protocol import MsgType
 from .sim import make_sim_device
 from .ui import Dashboard
@@ -156,6 +157,16 @@ def bench(
     ] = False,
 ) -> None:
     """Live dashboard: polls at 2 Hz and takes commands (V1O; P50; ...)."""
+    # Checked before opening the port: if we cannot run, there is no reason to
+    # have driven the outputs to their safe state on the way to failing.
+    if not stdin_is_interactive():
+        console.print(
+            "[red]the dashboard needs an interactive terminal.[/red]\n"
+            "Run it directly in a console, or use the one-shot commands "
+            "(ngs send / ngs pump / ngs valve / ngs flow) when piping or scripting.",
+        )
+        raise typer.Exit(2)
+
     obj, label = _open(port, sim, timeout)
     with obj.device:
         if not no_init:

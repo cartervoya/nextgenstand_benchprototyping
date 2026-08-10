@@ -93,6 +93,13 @@ class FakeDevice:
         del self._tx[: len(out)]
         return out
 
+    @property
+    def in_waiting(self) -> int:
+        """Bytes ready to read, as pyserial reports it. Present so the driver
+        takes the same code path here as against a real port."""
+        self._poll_stream()
+        return len(self._tx)
+
     def close(self) -> None:
         self.closed = True
 

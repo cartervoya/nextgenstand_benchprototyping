@@ -26,6 +26,14 @@ TEENSY_VID = 0x16C0
 
 DEFAULT_TIMEOUT = 1.0
 
+#: How long `wait_ready` keeps trying. Generous: it also covers a board that
+#: is still rebooting after a reset or a fresh flash.
+READY_TIMEOUT = 5.0
+
+#: Per-attempt timeout while waiting for the link. Short, because the whole
+#: point is to retry rather than sit through one long silence.
+_READY_ATTEMPT_TIMEOUT = 0.25
+
 #: How long to wait on the transport in one read. Short enough that a command
 #: timeout stays responsive, long enough not to spin the CPU.
 _READ_CHUNK_TIMEOUT = 0.02
@@ -120,8 +128,14 @@ class Device:
         *,
         timeout: float = DEFAULT_TIMEOUT,
         on_log: Callable[[str], None] | None = None,
+        wait_ready: bool = True,
     ) -> Device:
-        """Open a Teensy by port name, or the only attached one if omitted."""
+        """Open a Teensy by port name, or the only attached one if omitted.
+
+        Waits for the link to actually work before returning -- see
+        `wait_ready()`. Pass `wait_ready=False` to skip that when you are
+        deliberately talking to something that may not answer.
+        """
         import serial
 
         name = _resolve_port(port)
@@ -141,7 +155,39 @@ class Device:
         # clean buffer means the first command's response is the first thing we
         # see rather than the tail of something else.
         transport.reset_input_buffer()
-        return cls(transport, timeout=timeout, on_log=on_log)
+        device = cls(transport, timeout=timeout, on_log=on_log)
+        if wait_ready:
+            device.wait_ready()
+        return device
+
+    def wait_ready(self, timeout: float = READY_TIMEOUT) -> None:
+        """Ping until the device answers, or give up after `timeout`.
+
+        Opening the port is not the same as having a working link. Until
+        Windows finishes the CDC handshake and the firmware sees DTR, its
+        `ngs_board_write` finds `!Serial` and *drops* whatever it was about to
+        send -- so the first command after open reliably gets a request
+        through, is processed, and never hears back. The same gap appears
+        after a reset, while the board reboots.
+
+        Retrying with a short per-attempt timeout costs a few milliseconds on
+        a healthy link and turns "mystery timeout on the first command" into
+        "connected".
+        """
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                self._transact(p.MsgType.PING, timeout=_READY_ATTEMPT_TIMEOUT)
+                return
+            except (Timeout, p.NgsError):
+                if time.monotonic() >= deadline:
+                    raise Timeout(
+                        f"device did not respond within {timeout:g}s ({attempts} attempts). "
+                        "The port exists, so the board is powered -- is it running this "
+                        "firmware? Try: pio run -t upload"
+                    ) from None
 
     def close(self) -> None:
         self._t.close()
@@ -166,9 +212,25 @@ class Device:
         self._seq = (self._seq % 255) + 1
         return self._seq
 
+    def _read_available(self) -> bytes:
+        """Read what is there, without waiting for bytes that may never come.
+
+        pyserial's `read(n)` blocks until it has *n* bytes or the port timeout
+        expires -- so asking for a big buffer to "get whatever is available"
+        actually pays the full timeout on every single response. That alone
+        put 20 ms on every command.
+
+        `in_waiting` gives the real count; the `read(1)` fallback blocks only
+        until the first byte and returns as soon as it lands.
+        """
+        waiting = getattr(self._t, "in_waiting", 0)
+        if waiting:
+            return self._t.read(waiting)
+        return self._t.read(1)
+
     def _pump(self) -> list[Frame]:
         """Read whatever is available and file the unsolicited frames."""
-        data = self._t.read(4096)
+        data = self._read_available()
         if not data:
             return []
 
@@ -208,7 +270,8 @@ class Device:
                 raise p.NgsError(p.ErrCode.UNKNOWN_TYPE, seq, frame.type)
 
             if time.monotonic() >= deadline:
-                raise Timeout(f"no response to {msg_type.name} (seq={seq}) in {self.timeout:g}s")
+                waited = self.timeout if timeout is None else timeout
+                raise Timeout(f"no response to {msg_type.name} (seq={seq}) in {waited:g}s")
 
     def transact(self, msg_type: p.MsgType, payload: bytes = b"") -> bytes:
         """Send an arbitrary request and return its response payload.
