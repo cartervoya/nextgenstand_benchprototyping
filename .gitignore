@@ -1,0 +1,23 @@
+# PlatformIO build output and downloaded toolchains
+.pio/
+# Generated for clangd by `pio run -t compiledb`; machine-specific paths.
+compile_commands.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Captured bench data -- keep runs out of the repo, they get large fast.
+# Commit calibration constants in code instead.
+*.csv
+!host/tests/data/*.csv
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,53 @@
+# Python host for the NextGen Stand bench prototype.
+#
+# The package lives under host/ so the firmware tree (firmware/, platformio.ini)
+# and the host tree stay visibly separate while sharing one repo and one venv.
+#
+#   .\.venv\Scripts\python.exe -m pip install -e .
+#   .\.venv\Scripts\python.exe -m pytest
+#   .\.venv\Scripts\ngs.exe info
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ngs-host"
+version = "0.1.0"
+description = "Python host for the NextGen Stand Teensy 4.1 bench firmware"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    # Reference COBS implementation, used only to cross-check ours in the tests.
+    "cobs>=1.2",
+]
+
+[project.scripts]
+ngs = "ngs_host.cli:app"
+
+[tool.setuptools]
+package-dir = { "" = "host" }
+
+[tool.setuptools.packages.find]
+where = ["host"]
+
+[tool.pytest.ini_options]
+testpaths = ["host/tests"]
+# So the tests import ngs_host without requiring an editable install first.
+pythonpath = ["host"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["host"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

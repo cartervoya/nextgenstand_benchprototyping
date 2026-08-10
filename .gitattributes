@@ -1,0 +1,16 @@
+# Store everything with LF in the repository regardless of the checkout
+# platform. Without this, a file touched on Windows and a file touched
+# elsewhere differ on every line, and firmware diffs become unreviewable.
+* text=auto eol=lf
+
+# Windows-only helpers keep CRLF so cmd.exe does not choke on them.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary: never touch these.
+*.hex binary
+*.bin binary
+*.elf binary
+*.png binary
+*.pdf binary
