@@ -46,7 +46,12 @@ def snapshot_to_dict(snapshot: Snapshot, port: str, fw: str) -> dict[str, Any]:
                 {
                     "code": r.spec.code,
                     "name": r.spec.description,
-                    "value": r.text,
+                    "value": (
+                        f"{snapshot.control.setpoint_target:.0f} "
+                        f"{snapshot.control.mode_name} ({r.percent:.1f} %)"
+                        if snapshot.control is not None and snapshot.control.mode != 0
+                        else r.text
+                    ),
                     "kind": "pwm",
                     "detail": f"pin {r.spec.pin}, {r.spec.freq_hz / 1000:g} kHz, "
                     f"{r.spec.resolution}-bit",
@@ -77,6 +82,22 @@ def snapshot_to_dict(snapshot: Snapshot, port: str, fw: str) -> dict[str, Any]:
                 for r in snapshot.analogs.values()
             ],
         ],
+        "control": None
+        if snapshot.control is None
+        else {
+            "mode": snapshot.control.mode_name,
+            "auto": snapshot.control.mode != 0,
+            "setpoint": round(snapshot.control.setpoint_target, 1),
+            "setpoint_now": round(snapshot.control.setpoint, 1),
+            "measurement": round(snapshot.control.measurement, 1),
+            "error": round(snapshot.control.error, 1),
+            "output": round(snapshot.control.output, 1),
+            "p": round(snapshot.control.p_term, 2),
+            "i": round(snapshot.control.i_term, 2),
+            "d": round(snapshot.control.d_term, 2),
+            "flags": snapshot.control.flag_names(),
+            "faults": snapshot.control.fault_count,
+        },
         "status": None
         if snapshot.status is None
         else {
@@ -195,12 +216,15 @@ PAGE = """<!doctype html>
   button { background:var(--accent); border:0; border-radius:6px; color:#11131a;
            padding:9px 18px; font:inherit; font-weight:700; cursor:pointer; }
   .stop { background:var(--bad); color:#fff; }
+  .loop { color:#c678dd; margin-bottom:10px; min-height:1.4em; }
+  .loop.warn { color:var(--warn); } .loop.bad { color:var(--bad); font-weight:700; }
 </style>
 </head>
 <body><main>
   <h1>NextGen Stand bench</h1>
   <div class="bar ok" id="bar">connecting...</div>
   <table id="channels"></table>
+  <div id="loop" class="loop"></div>
   <div id="log"></div>
   <form id="form" autocomplete="off">
     <input id="line" placeholder="V1O;P50;   -- ? for help" autofocus>
@@ -243,6 +267,20 @@ function render(s) {
                "<span>crc-err " + st.rx_crc_errors + "</span>",
                "<span>loop-max " + st.loop_max_us + " us</span>",
                "<span>" + st.temp_c + " C</span>"].join("") : "");
+  }
+
+  const loop = $("loop"), ct = s.control;
+  if (!ct || !ct.auto) {
+    loop.className = "loop";
+    loop.textContent = ct && ct.faults
+      ? "loop: manual  (dropped out on a sensor fault " + ct.faults + "x)" : "";
+  } else {
+    loop.className = "loop" + (ct.flags.includes("FAULT") ? " bad"
+                    : (ct.flags.length ? " warn" : ""));
+    loop.textContent = "loop: " + ct.mode + "   sp " + ct.setpoint + "   meas " + ct.measurement
+      + "   err " + ct.error + "   P " + ct.p + "   I " + ct.i
+      + (ct.d ? "   D " + ct.d : "")
+      + (ct.flags.length ? "   [" + ct.flags.join(" ") + "]" : "");
   }
 
   $("channels").innerHTML = s.channels.map(c => {

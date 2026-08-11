@@ -319,7 +319,9 @@ def test_the_simulator_responds_to_the_pump_and_valve():
     The time constant is compressed to microseconds so the test settles within
     a few hundred reads instead of the real ~second.
     """
-    bench = Bench(Device(make_sim_device(tau=0.0005, noise_ml=0.0)))
+    # delay_s=0 as well: transport delay is measured in wall-clock seconds and
+    # this test deliberately runs hundreds of reads in a few milliseconds.
+    bench = Bench(Device(make_sim_device(tau=0.0005, noise_ml=0.0, delay_s=0.0)))
     bench.initialize()
 
     bench.set_valve("valve1", True)

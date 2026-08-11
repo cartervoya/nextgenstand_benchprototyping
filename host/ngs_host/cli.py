@@ -22,7 +22,7 @@ from .bench import BENCH_CONFIG, Bench
 from .commands import execute_line
 from .device import Device, find_ports
 from .keyboard import stdin_is_interactive
-from .protocol import MsgType
+from .protocol import AutotuneFail, AutotuneState, MsgType, TuningRule
 from .sim import make_sim_device
 from .ui import Dashboard
 
@@ -408,6 +408,156 @@ def pump(
     obj, _ = _open(port, sim)
     with obj.device:
         _run(obj, f"P{percent}")
+
+
+@app.command()
+def auto(
+    setpoint: Annotated[
+        float | None, typer.Argument(help="Flow setpoint in mL/min. Omit to query.")
+    ] = None,
+    off: Annotated[bool, typer.Option("--off", help="Return the pump to manual.")] = False,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+) -> None:
+    """Put the pump under closed-loop flow control."""
+    obj, _ = _open(port, sim)
+    with obj.device:
+        if off:
+            _run(obj, "PM")
+        elif setpoint is None:
+            _run(obj, "P?")
+        else:
+            _run(obj, f"PA{setpoint}")
+
+
+@app.command()
+def gains(
+    kp: Annotated[float | None, typer.Option(help="Proportional gain, % per mL/min.")] = None,
+    ki: Annotated[float | None, typer.Option(help="Integral gain, % per mL/min-second.")] = None,
+    kd: Annotated[float | None, typer.Option(help="Derivative gain. 0 on a noisy signal.")] = None,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+) -> None:
+    """Show or set the controller gains."""
+    obj, _ = _open(port, sim)
+    with obj.device:
+        if kp is None and ki is None and kd is None:
+            _run(obj, "K?")
+            return
+        cfg = obj.set_gains(kp, ki, kd)
+        console.print(f"kp {cfg.kp:g}  ki {cfg.ki:g}  kd {cfg.kd:g}")
+
+
+@app.command()
+def tune(
+    setpoint: Annotated[float, typer.Argument(help="Flow to oscillate around, mL/min.")],
+    amplitude: Annotated[float, typer.Option(help="Relay step, % output.")] = 10.0,
+    hysteresis: Annotated[
+        float | None, typer.Option(help="Switching band, mL/min. Defaults to the deadband.")
+    ] = None,
+    cycles: Annotated[int, typer.Option(help="Limit cycles to average.")] = 4,
+    rule: Annotated[
+        str, typer.Option(help="tyreus-luyben (default), ziegler-nichols, or pessen.")
+    ] = "tyreus-luyben",
+    timeout: Annotated[float, typer.Option(help="Give up after this many seconds.")] = 180.0,
+    adopt: Annotated[bool, typer.Option("--adopt", help="Apply the gains if it succeeds.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation.")] = False,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+) -> None:
+    """Autotune the flow loop by relay feedback.
+
+    The pump is driven up and down around `setpoint` on purpose until the flow
+    settles into a limit cycle; its amplitude and period give the ultimate gain
+    and period, and the tuning rule turns those into gains.
+    """
+    import time
+
+    rules = {
+        "tyreus-luyben": TuningRule.TYREUS_LUYBEN,
+        "ziegler-nichols": TuningRule.ZIEGLER_NICHOLS,
+        "pessen": TuningRule.PESSEN,
+    }
+    if rule not in rules:
+        raise typer.BadParameter(f"rule must be one of: {', '.join(rules)}")
+
+    obj, _ = _open(port, sim)
+    with obj.device:
+        if not yes and not typer.confirm(
+            f"\nThis oscillates the pump around {setpoint:g} mL/min for up to "
+            f"{timeout:g}s. Flow path open and ready?"
+        ):
+            raise typer.Abort
+
+        obj.start_autotune(
+            setpoint,
+            amplitude=amplitude,
+            hysteresis=hysteresis,
+            cycles=cycles,
+            rule=rules[rule],
+            timeout_s=timeout,
+        )
+
+        deadline = time.monotonic() + timeout + 10
+        try:
+            with console.status("running the relay experiment...") as status:
+                while time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    result = obj.autotune_result()
+                    state = obj.control_state()
+                    status.update(
+                        f"{result.state_name.lower()}, {result.cycles_done} cycles, "
+                        f"flow {state.measurement:.0f}, output {state.output:.0f} %"
+                    )
+                    if not result.running:
+                        break
+        finally:
+            # However we leave -- Ctrl-C, timeout, an exception -- the board
+            # must not be left driving the pump up and down on its own.
+            if obj.autotune_result().running:
+                obj.abort_autotune()
+                obj.stop()
+                console.print("[yellow]autotune still running on exit -- aborted[/yellow]")
+
+        result = obj.autotune_result()
+        if result.state != AutotuneState.DONE:
+            console.print(f"[red]autotune {result.state_name}: {result.fail_name.lower()}[/red]")
+            if result.state in (AutotuneState.SETTLING, AutotuneState.RELAY):
+                console.print(
+                    "[dim]It never completed a limit cycle. The flow has to actually swing "
+                    "past the setpoint: check the valves are open and the pump is running, "
+                    "and give it a longer --timeout.[/dim]"
+                )
+            if result.fail_reason == AutotuneFail.NO_SWING:
+                console.print(
+                    "[dim]The flow barely moved. Raise --amplitude, lower --hysteresis, "
+                    "or check the valves are actually open.[/dim]"
+                )
+            raise typer.Exit(1)
+
+        table = Table(box=None, show_header=False)
+        table.add_row("cycles", str(result.cycles_done))
+        table.add_row("ultimate gain Ku", f"{result.ku:.4g}")
+        table.add_row("ultimate period Tu", f"{result.tu:.3g} s")
+        table.add_row("process swing", f"{result.amplitude:.1f} mL/min")
+        table.add_row("period spread", f"{result.spread * 100:.0f} %")
+        table.add_row("", "")
+        table.add_row("kp", f"{result.kp:.4g}")
+        table.add_row("ki", f"{result.ki:.4g}")
+        table.add_row("kd", f"{result.kd:.4g}")
+        console.print(table)
+
+        if not result.trustworthy:
+            console.print(
+                "[yellow]The cycles were not consistent -- treat these numbers with "
+                "suspicion and re-run with more --cycles.[/yellow]"
+            )
+
+        if adopt:
+            obj.adopt_autotune()
+            console.print("\n[green]gains applied[/green]")
+        else:
+            console.print("\n[dim]Not applied. Re-run with --adopt, or send TA.[/dim]")
 
 
 @app.command()

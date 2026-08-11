@@ -21,7 +21,7 @@ from typing import ClassVar
 # Constants
 # --------------------------------------------------------------------------
 
-PROTO_VERSION = 1
+PROTO_VERSION = 2
 MAX_PAYLOAD = 512
 
 #: OR'd onto a request type to form the response type.
@@ -48,6 +48,11 @@ class MsgType(IntEnum):
     WRITE_PWM = 0x13
 
     SET_STREAM = 0x20
+
+    SET_CONTROL = 0x30
+    GET_CONTROL = 0x31
+    AUTOTUNE = 0x32
+    GET_AUTOTUNE = 0x33
 
     LOG = 0xF0
     TELEMETRY = 0xF1
@@ -113,9 +118,19 @@ _CTYPE_FMT = {
     "int16_t": "h",
     "uint32_t": "I",
     "int32_t": "i",
+    # IEEE-754 single, little-endian -- the same bytes the Cortex-M7 FPU uses.
+    "float": "f",
 }
 
-_CTYPE_SIZE = {"uint8_t": 1, "int8_t": 1, "uint16_t": 2, "int16_t": 2, "uint32_t": 4, "int32_t": 4}
+_CTYPE_SIZE = {
+    "uint8_t": 1,
+    "int8_t": 1,
+    "uint16_t": 2,
+    "int16_t": 2,
+    "uint32_t": 4,
+    "int32_t": 4,
+    "float": 4,
+}
 
 
 def _fmt_for(ctype: str, name: str) -> str:
@@ -351,6 +366,261 @@ class ErrorPayload(Payload):
     type: int = 0
 
 
+# --------------------------------------------------------------------------
+# Closed-loop pump control
+# --------------------------------------------------------------------------
+
+
+class PumpMode(IntEnum):
+    """NGS_PUMP_MODE_* -- who owns the pump output."""
+
+    MANUAL = 0x00
+    AUTO = 0x01
+    AUTOTUNE = 0x02
+
+
+class CtrlFlag(IntEnum):
+    """NGS_CTRL_FLAG_* -- what the loop is doing, as a bitmask."""
+
+    SATURATED = 0x01
+    WINDUP = 0x02
+    FAULT = 0x04
+    SLEWING = 0x08
+
+
+class CtrlOpt(IntEnum):
+    """NGS_CTRL_OPT_* -- optional behaviour, as a bitmask."""
+
+    FAULT_CHECK = 0x01
+
+
+class AutotuneAction(IntEnum):
+    ABORT = 0x00
+    START = 0x01
+
+
+class TuningRule(IntEnum):
+    """NGS_AT_RULE_* -- how measured Ku/Tu become gains."""
+
+    TYREUS_LUYBEN = 0x00
+    ZIEGLER_NICHOLS = 0x01
+    PESSEN = 0x02
+
+
+class AutotuneState(IntEnum):
+    IDLE = 0x00
+    SETTLING = 0x01
+    RELAY = 0x02
+    DONE = 0x03
+    FAILED = 0x04
+
+
+class AutotuneFail(IntEnum):
+    NONE = 0x00
+    TIMEOUT = 0x01
+    NO_SWING = 0x02
+    SENSOR = 0x03
+    ABORTED = 0x04
+    INCONSISTENT = 0x05
+
+
+@dataclass(slots=True)
+class ControlCfg(Payload):
+    C_NAME = "NgsControlCfgPayload"
+    FIELDS = (
+        ("uint8_t", "mode"),
+        ("uint8_t", "channel"),
+        ("uint8_t", "options"),
+        ("uint8_t", "_pad"),
+        ("float", "setpoint"),
+        ("float", "kp"),
+        ("float", "ki"),
+        ("float", "kd"),
+        ("float", "out_min"),
+        ("float", "out_max"),
+        ("float", "filter_tau_s"),
+        ("float", "deadband"),
+        ("float", "setpoint_slew"),
+        ("float", "output_slew"),
+        ("float", "cal_scale"),
+        ("float", "cal_offset"),
+        ("float", "fault_below"),
+        ("uint32_t", "period_us"),
+    )
+
+    mode: int = PumpMode.MANUAL
+    channel: int = 0
+    options: int = 0
+    setpoint: float = 0.0
+    kp: float = 0.05
+    ki: float = 0.02
+    kd: float = 0.0
+    out_min: float = 0.0
+    out_max: float = 100.0
+    filter_tau_s: float = 1.0
+    deadband: float = 0.0
+    setpoint_slew: float = 60.0
+    output_slew: float = 25.0
+    cal_scale: float = 1.0
+    cal_offset: float = 0.0
+    fault_below: float = 0.0
+    period_us: int = 20_000
+
+
+@dataclass(slots=True)
+class ControlState(Payload):
+    C_NAME = "NgsControlStatePayload"
+    FIELDS = (
+        ("uint8_t", "mode"),
+        ("uint8_t", "flags"),
+        ("uint8_t", "autotune_state"),
+        ("uint8_t", "_pad"),
+        ("float", "setpoint"),
+        ("float", "setpoint_target"),
+        ("float", "measurement"),
+        ("float", "measurement_raw"),
+        ("float", "output"),
+        ("float", "p_term"),
+        ("float", "i_term"),
+        ("float", "d_term"),
+        ("uint32_t", "updates"),
+        ("uint32_t", "fault_count"),
+    )
+
+    mode: int
+    flags: int
+    autotune_state: int
+    setpoint: float
+    setpoint_target: float
+    measurement: float
+    measurement_raw: float
+    output: float
+    p_term: float
+    i_term: float
+    d_term: float
+    updates: int
+    fault_count: int
+
+    @property
+    def mode_name(self) -> str:
+        try:
+            return PumpMode(self.mode).name
+        except ValueError:
+            return f"0x{self.mode:02X}"
+
+    @property
+    def saturated(self) -> bool:
+        return bool(self.flags & CtrlFlag.SATURATED)
+
+    @property
+    def winding_up(self) -> bool:
+        return bool(self.flags & CtrlFlag.WINDUP)
+
+    @property
+    def faulted(self) -> bool:
+        return bool(self.flags & CtrlFlag.FAULT)
+
+    @property
+    def slewing(self) -> bool:
+        return bool(self.flags & CtrlFlag.SLEWING)
+
+    @property
+    def error(self) -> float:
+        return self.setpoint - self.measurement
+
+    def flag_names(self) -> list[str]:
+        return [flag.name for flag in CtrlFlag if self.flags & flag]
+
+
+@dataclass(slots=True)
+class AutotuneCmd(Payload):
+    C_NAME = "NgsAutotuneCmdPayload"
+    FIELDS = (
+        ("uint8_t", "action"),
+        ("uint8_t", "cycles"),
+        ("uint8_t", "rule"),
+        ("uint8_t", "_pad"),
+        ("float", "setpoint"),
+        ("float", "amplitude"),
+        ("float", "hysteresis"),
+        ("uint32_t", "timeout_ms"),
+    )
+
+    action: int = AutotuneAction.START
+    cycles: int = 4
+    rule: int = TuningRule.TYREUS_LUYBEN
+    setpoint: float = 0.0
+    amplitude: float = 10.0
+    hysteresis: float = 0.0
+    timeout_ms: int = 120_000
+
+
+@dataclass(slots=True)
+class AutotuneResult(Payload):
+    C_NAME = "NgsAutotuneResultPayload"
+    FIELDS = (
+        ("uint8_t", "state"),
+        ("uint8_t", "fail_reason"),
+        ("uint8_t", "cycles_done"),
+        ("uint8_t", "rule"),
+        ("float", "ku"),
+        ("float", "tu"),
+        ("float", "amplitude"),
+        ("float", "kp"),
+        ("float", "ki"),
+        ("float", "kd"),
+        ("float", "spread"),
+    )
+
+    state: int
+    fail_reason: int
+    cycles_done: int
+    rule: int
+    ku: float
+    tu: float
+    amplitude: float
+    kp: float
+    ki: float
+    kd: float
+    spread: float
+
+    @property
+    def state_name(self) -> str:
+        try:
+            return AutotuneState(self.state).name
+        except ValueError:
+            return f"0x{self.state:02X}"
+
+    @property
+    def fail_name(self) -> str:
+        try:
+            return AutotuneFail(self.fail_reason).name
+        except ValueError:
+            return f"0x{self.fail_reason:02X}"
+
+    @property
+    def running(self) -> bool:
+        return self.state in (AutotuneState.SETTLING, AutotuneState.RELAY)
+
+    @property
+    def trustworthy(self) -> bool:
+        """Cycle-to-cycle period scatter under 20 %. Above that the limit cycle
+        never really settled and the gains describe noise."""
+        return self.state == AutotuneState.DONE and self.spread < 0.20
+
+
+def apply_rule(rule: int, ku: float, tu: float) -> tuple[float, float, float]:
+    """Mirror of ngs_control_apply_rule. Used to preview what a tuning rule
+    would give without asking the device to re-run the experiment."""
+    if rule == TuningRule.ZIEGLER_NICHOLS:
+        kp, ti, td = 0.45 * ku, tu / 1.2, 0.0
+    elif rule == TuningRule.PESSEN:
+        kp, ti, td = 0.7 * ku, 0.4 * tu, 0.15 * tu
+    else:  # Tyreus-Luyben, the conservative default
+        kp, ti, td = ku / 3.2, 2.2 * tu, 0.0
+    return kp, (kp / ti if ti > 0 else 0.0), kp * td
+
+
 @dataclass(slots=True)
 class Telemetry:
     """A decoded NGS_MSG_TELEMETRY frame: header plus its trailing samples.
@@ -406,4 +676,6 @@ RESPONSE_PAYLOAD: dict[int, type[Payload]] = {
     MsgType.GET_STATUS: Status,
     MsgType.GET_GPIO: GpioGet,
     MsgType.READ_ADC: AdcRead,
+    MsgType.GET_CONTROL: ControlState,
+    MsgType.GET_AUTOTUNE: AutotuneResult,
 }

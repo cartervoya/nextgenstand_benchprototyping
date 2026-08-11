@@ -32,8 +32,10 @@
 extern "C" {
 #endif
 
-/* Bumped on any incompatible change to framing, message ids, or struct layout. */
-#define NGS_PROTO_VERSION 1
+/* Bumped on any incompatible change to framing, message ids, or struct layout.
+ *
+ * v2 added the closed-loop pump controller (0x30..0x33) and its payloads. */
+#define NGS_PROTO_VERSION 2
 
 /* Largest payload either side will emit or accept. Keeps every buffer static. */
 #define NGS_MAX_PAYLOAD 512u
@@ -58,6 +60,14 @@ extern "C" {
 #define NGS_MSG_WRITE_PWM 0x13u /* -> NgsPwmWritePayload <- (empty)          */
 
 #define NGS_MSG_SET_STREAM 0x20u /* -> NgsStreamCfgPayload <- (empty)        */
+
+/* Closed-loop pump control. The loop runs on the device at a fixed period --
+ * a control loop paced by USB round trips is at the mercy of host scheduling,
+ * which is exactly the jitter a controller must not have. */
+#define NGS_MSG_SET_CONTROL 0x30u /* -> NgsControlCfgPayload  <- (empty)      */
+#define NGS_MSG_GET_CONTROL 0x31u /* -> (empty) <- NgsControlStatePayload     */
+#define NGS_MSG_AUTOTUNE 0x32u    /* -> NgsAutotuneCmdPayload <- (empty)      */
+#define NGS_MSG_GET_AUTOTUNE 0x33u /* -> (empty) <- NgsAutotuneResultPayload  */
 
 #define NGS_MSG_LOG 0xF0u       /* <- ASCII text, no NUL terminator          */
 #define NGS_MSG_TELEMETRY 0xF1u /* <- NgsTelemetryPayload                    */
@@ -186,6 +196,135 @@ typedef struct NGS_PACKED {
     uint8_t _pad[2];
     /* uint16_t samples[count] follows */
 } NgsTelemetryHeader;
+
+/* ---------------------------------------------------------------------------
+ * Closed-loop pump control
+ *
+ * Floats on the wire, IEEE-754 little-endian: the Cortex-M7 has an FPU and
+ * Python's struct speaks the same format, so fixed-point would buy nothing but
+ * a class of scaling bugs.
+ *
+ * The device works in engineering units (mL/min), not ADC counts, so setpoint,
+ * gains and autotune results all mean something to an operator. It gets there
+ * with the linear calibration the host supplies below -- the calibration still
+ * lives in host config, under version control; the device is just told the two
+ * numbers it needs to apply it.
+ * ------------------------------------------------------------------------- */
+
+#define NGS_PUMP_MODE_MANUAL 0x00u   /* output follows NGS_MSG_WRITE_PWM      */
+#define NGS_PUMP_MODE_AUTO 0x01u     /* output follows the controller         */
+#define NGS_PUMP_MODE_AUTOTUNE 0x02u /* relay experiment in progress          */
+
+/* NgsControlStatePayload.flags */
+#define NGS_CTRL_FLAG_SATURATED 0x01u /* output pinned at a limit             */
+#define NGS_CTRL_FLAG_WINDUP 0x02u    /* integration held off this tick       */
+#define NGS_CTRL_FLAG_FAULT 0x04u     /* sensor out of range; loop dropped out */
+#define NGS_CTRL_FLAG_SLEWING 0x08u   /* setpoint still ramping to target     */
+
+/* NGS_MSG_SET_CONTROL request. Sent whole: partial updates would need a
+ * field mask, and re-sending eleven floats costs nothing at these rates. */
+/* NgsControlCfgPayload.options */
+#define NGS_CTRL_OPT_FAULT_CHECK 0x01u /* enable the `fault_below` trip       */
+
+typedef struct NGS_PACKED {
+    uint8_t mode;    /* NGS_PUMP_MODE_MANUAL or _AUTO                        */
+    uint8_t channel; /* ADC channel the loop measures                        */
+    uint8_t options; /* NGS_CTRL_OPT_*                                       */
+    uint8_t _pad;
+    float setpoint;     /* engineering units                                 */
+    float kp;           /* % output per unit of error                        */
+    float ki;           /* % per unit-second                                 */
+    float kd;           /* % per (unit/second); 0 disables derivative        */
+    float out_min;      /* % -- also the floor the integrator may wind to    */
+    float out_max;      /* %                                                 */
+    float filter_tau_s; /* measurement low-pass; 0 disables                  */
+    float deadband;     /* units; no integration while |error| is under it   */
+    float setpoint_slew; /* units/s, 0 = step immediately                    */
+    float output_slew;  /* %/s, 0 = unlimited                                */
+    float cal_scale;    /* units per ADC count                               */
+    float cal_offset;   /* ADC counts reading zero units                     */
+    /* Units; below this the sensor is considered dead. Signed and enabled by
+     * a flag rather than by being non-zero: on a 4-20 mA loop the meaningful
+     * threshold is *negative* (under 4 mA reads below zero flow), so "0 means
+     * off" would rule out exactly the value you want. */
+    float fault_below;
+    uint32_t period_us; /* control interval                                  */
+} NgsControlCfgPayload;
+
+/* NGS_MSG_GET_CONTROL response. Everything needed to draw the loop and to
+ * explain what it is doing -- the split P/I/D terms are what turn "the output
+ * is 40 %" into "the integrator is carrying it". */
+typedef struct NGS_PACKED {
+    uint8_t mode;
+    uint8_t flags;          /* NGS_CTRL_FLAG_*                               */
+    uint8_t autotune_state; /* NGS_AT_*                                      */
+    uint8_t _pad;
+    float setpoint;         /* the slew-limited setpoint actually in use     */
+    float setpoint_target;  /* what was last commanded                       */
+    float measurement;      /* filtered                                      */
+    float measurement_raw;  /* same sample, unfiltered                       */
+    float output;           /* % duty currently applied                      */
+    float p_term;
+    float i_term;
+    float d_term;
+    uint32_t updates;       /* control ticks since the loop was enabled      */
+    uint32_t fault_count;   /* times the loop dropped out on a sensor fault  */
+} NgsControlStatePayload;
+
+/* NGS_MSG_AUTOTUNE request.
+ *
+ * Relay feedback (Astrom-Hagglund): drive the output between two levels around
+ * an operating point and let the process oscillate. The amplitude and period
+ * of that limit cycle give the ultimate gain and period directly, without
+ * needing a model and without ever pushing the loop unstable on purpose. */
+#define NGS_AT_ACTION_ABORT 0x00u
+#define NGS_AT_ACTION_START 0x01u
+
+/* Tuning rule applied to the measured Ku/Tu. */
+#define NGS_AT_RULE_TYREUS_LUYBEN 0x00u /* conservative; the default         */
+#define NGS_AT_RULE_ZIEGLER_NICHOLS 0x01u
+#define NGS_AT_RULE_PESSEN 0x02u /* faster, less damped                      */
+
+typedef struct NGS_PACKED {
+    uint8_t action; /* NGS_AT_ACTION_*                                       */
+    uint8_t cycles; /* limit cycles to average before deciding               */
+    uint8_t rule;   /* NGS_AT_RULE_*                                         */
+    uint8_t _pad;
+    float setpoint;   /* operating point to oscillate about                  */
+    float amplitude;  /* relay step, % output, either side of the bias       */
+    float hysteresis; /* units; must clear the sensor noise or the relay will
+                       * chatter on noise instead of on the process          */
+    uint32_t timeout_ms;
+} NgsAutotuneCmdPayload;
+
+#define NGS_AT_IDLE 0x00u
+#define NGS_AT_SETTLING 0x01u
+#define NGS_AT_RELAY 0x02u
+#define NGS_AT_DONE 0x03u
+#define NGS_AT_FAILED 0x04u
+
+/* Why an autotune stopped short. */
+#define NGS_AT_FAIL_NONE 0x00u
+#define NGS_AT_FAIL_TIMEOUT 0x01u    /* never completed enough cycles        */
+#define NGS_AT_FAIL_NO_SWING 0x02u   /* amplitude under the hysteresis band  */
+#define NGS_AT_FAIL_SENSOR 0x03u     /* sensor faulted mid-experiment        */
+#define NGS_AT_FAIL_ABORTED 0x04u    /* operator stopped it                  */
+#define NGS_AT_FAIL_INCONSISTENT 0x05u /* cycle periods too scattered to use */
+
+typedef struct NGS_PACKED {
+    uint8_t state;       /* NGS_AT_*                                         */
+    uint8_t fail_reason; /* NGS_AT_FAIL_*                                    */
+    uint8_t cycles_done;
+    uint8_t rule;
+    float ku;       /* ultimate gain, from the limit cycle                   */
+    float tu;       /* ultimate period, seconds                              */
+    float amplitude; /* measured process swing, units peak-to-peak           */
+    float kp;       /* suggested gains, from `rule`                          */
+    float ki;
+    float kd;
+    float spread;   /* worst period deviation, as a fraction -- how much to
+                     * trust the numbers above                               */
+} NgsAutotuneResultPayload;
 
 /* NGS_MSG_ERROR payload. `seq` and `type` identify the request that failed,
  * so a host with several requests in flight can attribute the failure. */

@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from . import protocol as p
 from .bench import AnalogInputSpec, Bench, PwmOutputSpec, ValveSpec
 from .device import Timeout
 from .protocol import NgsError
@@ -104,6 +105,12 @@ def _dispatch(bench: Bench, text: str) -> CommandResult:
     if action is not None:
         return _GLOBALS[action](bench)
 
+    # Tuning and autotune are loop-wide rather than per-channel, so they get
+    # their own prefixes instead of hanging off a channel code.
+    for prefix in sorted(_LOOP_COMMANDS, key=len, reverse=True):
+        if upper.startswith(prefix):
+            return _LOOP_COMMANDS[prefix](bench, upper[len(prefix) :].strip())
+
     code, arg = _split_code(bench, upper)
     spec = bench.config.by_code()[code]
 
@@ -158,10 +165,65 @@ def _valve_result(spec: ValveSpec, is_open: bool) -> CommandResult:
     )
 
 
+def _has_loop(bench: Bench, spec: PwmOutputSpec) -> bool:
+    return any(c.output == spec.name for c in bench.config.controls)
+
+
 def _pwm_command(bench: Bench, spec: PwmOutputSpec, arg: str) -> CommandResult:
     if arg in ("", "?"):
+        if _has_loop(bench, spec):
+            state = bench.control_state()
+            if state.mode != p.PumpMode.MANUAL:
+                flags = ", ".join(state.flag_names())
+                return CommandResult(
+                    True,
+                    f"{spec.code} {spec.description}: AUTO, setpoint {state.setpoint_target:.1f}"
+                    f" (now {state.setpoint:.1f}), flow {state.measurement:.1f},"
+                    f" output {state.output:.1f} %" + (f"  [{flags}]" if flags else ""),
+                )
         return CommandResult(
-            True, f"{spec.code} {spec.description}: {bench.pwm_percent(spec.name):.1f} %"
+            True, f"{spec.code} {spec.description}: MANUAL, {bench.pwm_percent(spec.name):.1f} %"
+        )
+
+    if arg in ("M", "MAN", "MANUAL"):
+        if not _has_loop(bench, spec):
+            raise CommandError(f"{spec.code} has no control loop configured")
+        bench.set_pump_mode(False, output=spec.name)
+        return CommandResult(
+            True,
+            f"{spec.code} {spec.description}: MANUAL, holding "
+            f"{bench.pwm_percent(spec.name):.1f} %",
+        )
+
+    if arg.startswith("A"):
+        if not _has_loop(bench, spec):
+            raise CommandError(f"{spec.code} has no control loop configured")
+        rest = arg[1:].strip()
+        if rest in ("", "?"):
+            state = bench.control_state()
+            return CommandResult(
+                True,
+                f"{spec.code} {spec.description}: {state.mode_name}, "
+                f"setpoint {state.setpoint_target:.1f}",
+            )
+        try:
+            setpoint = float(rest)
+        except ValueError:
+            raise CommandError(
+                f"{spec.code}A: expected a setpoint like {spec.code}A250, got {rest!r}"
+            ) from None
+        bench.set_pump_mode(True, setpoint, output=spec.name)
+        return CommandResult(
+            True, f"{spec.code} {spec.description}: AUTO, setpoint {setpoint:.1f}"
+        )
+
+    # A bare number means manual duty. Refuse it while the loop owns the output
+    # rather than letting it apply and then be silently overwritten on the next
+    # control tick.
+    if _has_loop(bench, spec) and bench.control_state().mode != p.PumpMode.MANUAL:
+        raise CommandError(
+            f"{spec.code} is in AUTO. Use {spec.code}M for manual, "
+            f"or {spec.code}A<setpoint> to change the setpoint."
         )
 
     relative = arg[0] in "+-"
@@ -189,6 +251,135 @@ def _analog_command(bench: Bench, spec: AnalogInputSpec, arg: str) -> CommandRes
         f"{spec.code} {spec.description}: {reading.text}  "
         f"({reading.volts:.3f} V, raw {reading.raw})",
     )
+
+
+# --------------------------------------------------------------------------
+# Tuning and autotune
+# --------------------------------------------------------------------------
+
+
+def _gain_command(field: str):
+    """Build a handler for one gain. `K?` shows them all."""
+
+    def handler(bench: Bench, arg: str) -> CommandResult:
+        if arg in ("", "?"):
+            return _show_tuning(bench)
+        try:
+            value = float(arg)
+        except ValueError:
+            raise CommandError(f"K{field.upper()}: expected a number, got {arg!r}") from None
+        cfg = bench.set_gains(**{field: value})
+        return CommandResult(True, _tuning_text(cfg))
+
+    return handler
+
+
+def _tuning_text(cfg) -> str:
+    return (
+        f"gains: kp {cfg.kp:g}  ki {cfg.ki:g}  kd {cfg.kd:g}   "
+        f"filter {cfg.filter_tau_s:g} s  deadband {cfg.deadband:g}"
+    )
+
+
+def _show_tuning(bench: Bench, _arg: str = "") -> CommandResult:
+    if not bench.config.controls:
+        raise CommandError("no control loop is configured")
+    return CommandResult(True, _tuning_text(bench.control_cfg()))
+
+
+def _filter_command(bench: Bench, arg: str) -> CommandResult:
+    if arg in ("", "?"):
+        return _show_tuning(bench)
+    try:
+        tau = float(arg)
+    except ValueError:
+        raise CommandError(f"KF: expected a time constant in seconds, got {arg!r}") from None
+    if tau < 0.0:
+        raise CommandError("KF: the filter time constant cannot be negative")
+    from dataclasses import replace
+
+    bench.set_control_cfg(replace(bench.control_cfg(), filter_tau_s=tau))
+    return CommandResult(True, _tuning_text(bench.control_cfg()))
+
+
+def _deadband_command(bench: Bench, arg: str) -> CommandResult:
+    if arg in ("", "?"):
+        return _show_tuning(bench)
+    try:
+        band = float(arg)
+    except ValueError:
+        raise CommandError(f"KB: expected a deadband in flow units, got {arg!r}") from None
+    if band < 0.0:
+        raise CommandError("KB: the deadband cannot be negative")
+    from dataclasses import replace
+
+    bench.set_control_cfg(replace(bench.control_cfg(), deadband=band))
+    return CommandResult(True, _tuning_text(bench.control_cfg()))
+
+
+def _autotune_command(bench: Bench, arg: str) -> CommandResult:
+    """`T<setpoint>` starts, `T?` reports, `TX` aborts, `TA` adopts."""
+    if not bench.config.controls:
+        raise CommandError("no control loop is configured")
+
+    if arg in ("", "?"):
+        return CommandResult(True, _autotune_text(bench.autotune_result()))
+
+    if arg in ("X", "STOP", "ABORT"):
+        bench.abort_autotune()
+        return CommandResult(True, "autotune aborted; pump back to manual")
+
+    if arg in ("A", "ADOPT"):
+        result = bench.adopt_autotune()
+        return CommandResult(
+            True,
+            f"adopted kp {result.kp:g}  ki {result.ki:g}  kd {result.kd:g}"
+            + ("" if result.trustworthy else "   (note: cycle spread was high)"),
+        )
+
+    try:
+        setpoint = float(arg)
+    except ValueError:
+        raise CommandError(
+            f"T: expected a setpoint to tune around like T250, got {arg!r}. "
+            "T? reports, TX aborts, TA adopts the result."
+        ) from None
+
+    bench.start_autotune(setpoint)
+    return CommandResult(
+        True,
+        f"autotune started around {setpoint:g} -- the pump will oscillate on purpose. "
+        "T? for progress, TX to stop.",
+    )
+
+
+def _autotune_text(result) -> str:
+    if result.state == p.AutotuneState.IDLE:
+        return "autotune: never run"
+    if result.running:
+        return f"autotune: {result.state_name.lower()}, {result.cycles_done} cycles so far"
+    if result.state == p.AutotuneState.FAILED:
+        return f"autotune: FAILED ({result.fail_name.lower()})"
+
+    trust = "" if result.trustworthy else f"   (period spread {result.spread * 100:.0f} %, "\
+        "treat with suspicion)"
+    return (
+        f"autotune: done in {result.cycles_done} cycles. "
+        f"Ku {result.ku:.4g}, Tu {result.tu:.3g} s, swing {result.amplitude:.1f} -> "
+        f"kp {result.kp:g}  ki {result.ki:g}  kd {result.kd:g}. TA to adopt.{trust}"
+    )
+
+
+#: Prefix -> handler. Longest prefix wins, so KP beats K.
+_LOOP_COMMANDS: dict[str, Callable[[Bench, str], CommandResult]] = {
+    "KP": _gain_command("kp"),
+    "KI": _gain_command("ki"),
+    "KD": _gain_command("kd"),
+    "KF": _filter_command,
+    "KB": _deadband_command,
+    "K": _show_tuning,
+    "T": _autotune_command,
+}
 
 
 # --------------------------------------------------------------------------
@@ -247,11 +438,34 @@ def help_text(bench: Bench) -> str:
             f"set / adjust / query {pwm.description} "
             f"(pin {pwm.pin}, {pwm.freq_hz / 1000:g} kHz)",
         ))
+        if any(c.output == pwm.name for c in bench.config.controls):
+            unit = next(
+                (
+                    a.unit
+                    for c in bench.config.controls
+                    if c.output == pwm.name
+                    for a in bench.config.analogs
+                    if a.name == c.input
+                ),
+                "units",
+            )
+            rows.append((
+                f"{pwm.code}A<setpoint> / {pwm.code}M",
+                f"closed-loop on the flow setpoint ({unit}) / back to manual",
+            ))
     for analog in bench.config.analogs:
         rows.append((
             f"{analog.code}?",
             f"read {analog.description} (pin {analog.pin}, {analog.unit})",
         ))
+
+    if bench.config.controls:
+        rows += [
+            ("K? / KP<n> / KI<n> / KD<n>", "show or set the loop gains"),
+            ("KF<seconds> / KB<units>", "measurement filter / integration deadband"),
+            ("T<setpoint>", "autotune around a setpoint (the pump will oscillate)"),
+            ("T? / TA / TX", "autotune progress / adopt the gains / abort"),
+        ]
 
     rows += [
         ("S", "device status"),

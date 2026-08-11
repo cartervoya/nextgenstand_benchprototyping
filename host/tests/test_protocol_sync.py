@@ -125,7 +125,15 @@ def test_struct_fields_match(cls, structs):
 
 @pytest.mark.parametrize("cls", payload_classes(), ids=lambda c: c.C_NAME)
 def test_struct_size_is_what_the_c_compiler_would_produce(cls, structs):
-    sizes = {"uint8_t": 1, "int8_t": 1, "uint16_t": 2, "int16_t": 2, "uint32_t": 4, "int32_t": 4}
+    sizes = {
+        "uint8_t": 1,
+        "int8_t": 1,
+        "uint16_t": 2,
+        "int16_t": 2,
+        "uint32_t": 4,
+        "int32_t": 4,
+        "float": 4,
+    }
     expected = 0
     for ctype, _name in structs[cls.C_NAME]:
         base, _, count = ctype.partition("[")

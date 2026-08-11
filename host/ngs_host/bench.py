@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
 
 from . import protocol as p
 from .device import Device
@@ -169,10 +170,47 @@ class PwmOutputSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlSpec:
+    """How a PWM output is closed around an analog input.
+
+    The device runs the loop, but everything here is host knowledge: which
+    sensor feeds which pump, what the gains mean, where the sensor is
+    considered dead. The device is handed the two calibration numbers it needs
+    and works in mL/min from there.
+    """
+
+    output: str  # PwmOutputSpec.name
+    input: str  # AnalogInputSpec.name
+
+    kp: float = 0.05
+    ki: float = 0.02
+    kd: float = 0.0
+
+    #: Measurement low-pass. A second is generous, and this loop is allowed to
+    #: be slow -- stability matters far more than speed here.
+    filter_tau_s: float = 1.0
+    #: No integration while the error is under this. Sized to the sensor noise,
+    #: so the loop stops hunting once it is as close as the sensor can tell.
+    deadband: float = 2.0
+    #: Setpoint ramp rate. Full scale in ten seconds by default.
+    setpoint_slew: float = 60.0
+    output_slew: float = 25.0
+    out_min: float = 0.0
+    out_max: float = 100.0
+    period_us: int = 20_000
+
+    #: Margin below zero flow that means the sensor is dead rather than idle.
+    #: Negative because on a 4-20 mA loop, under 4 mA reads below zero.
+    fault_below: float = -25.0
+    fault_check: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class BenchConfig:
     valves: tuple[ValveSpec, ...] = ()
     analogs: tuple[AnalogInputSpec, ...] = ()
     pwms: tuple[PwmOutputSpec, ...] = ()
+    controls: tuple[ControlSpec, ...] = ()
 
     def by_code(self) -> dict[str, ValveSpec | AnalogInputSpec | PwmOutputSpec]:
         """Command code -> spec, for the parser and the CLI. Codes are matched
@@ -265,6 +303,11 @@ BENCH_CONFIG = BenchConfig(
             description="Pump speed",
         ),
     ),
+    controls=(
+        # The pump chases the flow meter. Gains are deliberately timid
+        # starting values -- run `ngs tune` on the real rig to replace them.
+        ControlSpec(output="pump", input="flow"),
+    ),
 )
 
 
@@ -336,7 +379,8 @@ class Snapshot:
     analogs: dict[str, AnalogReading] = field(default_factory=dict)
     pwms: dict[str, PwmReading] = field(default_factory=dict)
     status: p.Status | None = None
-    #: Set when the poll itself failed; the readings above are then stale.
+    #: None when no loop is configured, or when the poll failed.
+    control: p.ControlState | None = None
     error: str | None = None
 
     @property
@@ -369,6 +413,195 @@ class Bench:
         # What we last commanded, so a readback that disagrees can be flagged
         # rather than silently believed.
         self._valve_commanded: dict[str, bool] = {}
+        # Live controller settings, seeded from the config and then edited by
+        # the operator or replaced wholesale by an autotune. Held here because
+        # the device has no notion of "the gains I was configured with before
+        # someone switched to manual".
+        self._control_cfg: dict[str, p.ControlCfg] = {
+            spec.output: self._initial_control_cfg(spec) for spec in config.controls
+        }
+
+    # -- control configuration ---------------------------------------------
+
+    def _control_spec(self, output: str) -> ControlSpec:
+        for spec in self.config.controls:
+            if spec.output == output:
+                return spec
+        known = ", ".join(s.output for s in self.config.controls) or "none configured"
+        raise KeyError(f"no control loop drives {output!r}. Known: {known}")
+
+    def calibration(self, analog: AnalogInputSpec, adc_bits: int = 12) -> tuple[float, float]:
+        """The sensor's linear calibration as (units per count, count at zero).
+
+        The device needs the loop's measurement in engineering units so the
+        setpoint and gains mean something, but it has no business knowing what
+        a flow meter is. These two numbers are the whole of what it is told;
+        the calibration itself still lives here, in version control.
+        """
+        full_scale = float((1 << adc_bits) - 1)
+        volts_per_count = ADC_FULL_SCALE_V / full_scale
+        units_per_volt = (analog.value_max - analog.value_min) / (analog.v_max - analog.v_min)
+
+        scale = volts_per_count * units_per_volt
+        # value(counts) = scale * counts + intercept, so the zero crossing is
+        # at -intercept / scale.
+        intercept = analog.value_min - analog.v_min * units_per_volt
+        return scale, -intercept / scale
+
+    def _initial_control_cfg(self, spec: ControlSpec) -> p.ControlCfg:
+        analog = self._analog(spec.input)
+        scale, offset = self.calibration(analog)
+        return p.ControlCfg(
+            mode=p.PumpMode.MANUAL,
+            channel=analog.channel,
+            options=p.CtrlOpt.FAULT_CHECK if spec.fault_check else 0,
+            setpoint=0.0,
+            kp=spec.kp,
+            ki=spec.ki,
+            kd=spec.kd,
+            out_min=spec.out_min,
+            out_max=spec.out_max,
+            filter_tau_s=spec.filter_tau_s,
+            deadband=spec.deadband,
+            setpoint_slew=spec.setpoint_slew,
+            output_slew=spec.output_slew,
+            cal_scale=scale,
+            cal_offset=offset,
+            fault_below=spec.fault_below,
+            period_us=spec.period_us,
+        )
+
+    def control_cfg(self, output: str = "pump") -> p.ControlCfg:
+        """The settings that would be pushed on the next mode change."""
+        return self._control_cfg[self._control_spec(output).output]
+
+    def set_control_cfg(self, cfg: p.ControlCfg, output: str = "pump") -> None:
+        """Replace the settings and, if the loop is running, apply them now.
+
+        Refuses while an autotune is in progress. The alternatives are both
+        worse: pushing the config would cancel the experiment as a side effect
+        of typing a gain, and doing nothing would silently discard the change
+        until the next mode switch.
+        """
+        spec = self._control_spec(output)
+        if self.autotune_result().running:
+            raise ValueError("an autotune is running -- TX to abort it before changing gains")
+
+        self._control_cfg[spec.output] = cfg
+        if cfg.mode == p.PumpMode.AUTO:
+            self.device.set_control(cfg)
+
+    def set_gains(
+        self,
+        kp: float | None = None,
+        ki: float | None = None,
+        kd: float | None = None,
+        output: str = "pump",
+    ) -> p.ControlCfg:
+        """Update gains, keeping everything else. Applied live in auto."""
+        cfg = replace(
+            self.control_cfg(output),
+            kp=self.control_cfg(output).kp if kp is None else kp,
+            ki=self.control_cfg(output).ki if ki is None else ki,
+            kd=self.control_cfg(output).kd if kd is None else kd,
+        )
+        for value, name in ((cfg.kp, "kp"), (cfg.ki, "ki"), (cfg.kd, "kd")):
+            if value < 0.0:
+                raise ValueError(f"{name} must not be negative -- that is positive feedback")
+        self.set_control_cfg(cfg, output)
+        return cfg
+
+    def set_pump_mode(
+        self, auto: bool, setpoint: float | None = None, output: str = "pump"
+    ) -> None:
+        """Switch the pump between manual and closed-loop control.
+
+        Going to auto is bumpless -- the device seeds its integrator from the
+        duty already applied, so the pump does not step when the mode changes.
+        Coming back to manual leaves the output where the loop left it, which
+        is why this does not force it to zero: an operator taking manual
+        control of a running pump wants it to keep running.
+        """
+        spec = self._control_spec(output)
+        analog = self._analog(spec.input)
+
+        if auto and setpoint is not None:
+            limit = analog.value_max
+            if not 0.0 <= setpoint <= limit:
+                raise ValueError(
+                    f"setpoint {setpoint:g} outside the sensor's 0-{limit:g} {analog.unit}"
+                )
+
+        cfg = replace(
+            self.control_cfg(output),
+            mode=p.PumpMode.AUTO if auto else p.PumpMode.MANUAL,
+            setpoint=self.control_cfg(output).setpoint if setpoint is None else setpoint,
+        )
+        self._control_cfg[spec.output] = cfg
+        self.device.set_control(cfg)
+
+        if not auto:
+            # Keep the cached manual percentage in step with whatever the loop
+            # left behind, so the display and a later `P?` agree with reality.
+            self._pwm_percent[spec.output] = self.device.control().output
+
+    def set_setpoint(self, value: float, output: str = "pump") -> None:
+        self.set_pump_mode(True, value, output)
+
+    def control_state(self) -> p.ControlState:
+        return self.device.control()
+
+    # -- autotune ----------------------------------------------------------
+
+    def start_autotune(
+        self,
+        setpoint: float,
+        *,
+        amplitude: float = 10.0,
+        hysteresis: float | None = None,
+        cycles: int = 4,
+        rule: int = p.TuningRule.TYREUS_LUYBEN,
+        timeout_s: float = 180.0,
+        output: str = "pump",
+    ) -> None:
+        """Kick off a relay autotune around `setpoint`.
+
+        The default hysteresis is derived from the configured deadband rather
+        than left at zero: a relay with no hysteresis on a noisy signal
+        switches on the noise instead of on the process, and returns a
+        confidently wrong ultimate period.
+        """
+        spec = self._control_spec(output)
+        if hysteresis is None:
+            hysteresis = max(spec.deadband, 1.0)
+
+        self.device.autotune(
+            p.AutotuneCmd(
+                action=p.AutotuneAction.START,
+                cycles=cycles,
+                rule=rule,
+                setpoint=setpoint,
+                amplitude=amplitude,
+                hysteresis=hysteresis,
+                timeout_ms=int(timeout_s * 1000),
+            )
+        )
+
+    def abort_autotune(self) -> None:
+        self.device.autotune(p.AutotuneCmd(action=p.AutotuneAction.ABORT))
+
+    def autotune_result(self) -> p.AutotuneResult:
+        return self.device.autotune_result()
+
+    def adopt_autotune(self, output: str = "pump") -> p.AutotuneResult:
+        """Take the gains a finished autotune suggested. Refuses anything the
+        device did not finish cleanly, so a timed-out run cannot be adopted by
+        accident."""
+        result = self.autotune_result()
+        if result.state != p.AutotuneState.DONE:
+            raise ValueError(f"autotune did not finish cleanly ({result.state_name})")
+        self.set_gains(result.kp, result.ki, result.kd, output=output)
+        return result
 
     # -- setup -------------------------------------------------------------
 
@@ -379,6 +612,9 @@ class Bench:
         Safe to call on an already-running bench -- it is also how you recover
         after the board resets underneath you.
         """
+        # Same reason as stop(): a running loop would refuse the PWM writes.
+        for spec in self.config.controls:
+            self.set_pump_mode(False, output=spec.output)
         for valve in self.config.valves:
             self.set_valve(valve.name, False)
         for pwm in self.config.pwms:
@@ -386,7 +622,18 @@ class Bench:
 
     def stop(self) -> None:
         """Everything to its safe default. Wired to the `X` command, and worth
-        calling from a `finally` in any script that drives the pump."""
+        calling from a `finally` in any script that drives the pump.
+
+        Drops any closed loop to manual *first*. The device refuses a manual
+        PWM write while the loop owns the output -- correctly, since the loop
+        would overwrite it on the next tick -- so without this the emergency
+        stop fails with BUSY at exactly the moment it is needed.
+        """
+        for spec in self.config.controls:
+            # Best effort: a loop we cannot switch off must not stop us from
+            # zeroing the outputs below.
+            with suppress(p.NgsError, KeyError):
+                self.set_pump_mode(False, output=spec.output)
         for pwm in self.config.pwms:
             self.set_pwm(pwm.name, pwm.default_percent)
         for valve in self.config.valves:
@@ -457,10 +704,22 @@ class Bench:
         try:
             valves = {v.name: self.read_valve(v.name) for v in self.config.valves}
             analogs = {a.name: self.read_analog(a.name) for a in self.config.analogs}
+            control = self.device.control() if self.config.controls else None
             pwms = {
-                s.name: PwmReading(s, self._pwm_percent[s.name]) for s in self.config.pwms
+                s.name: PwmReading(
+                    s,
+                    # In auto the loop owns the duty; the cached manual value
+                    # would be stale and quietly wrong on screen.
+                    control.output
+                    if control is not None
+                    and control.mode != p.PumpMode.MANUAL
+                    and any(c.output == s.name for c in self.config.controls)
+                    else self._pwm_percent[s.name],
+                )
+                for s in self.config.pwms
             }
             status = self.device.status() if include_status else None
+            control = self.device.control() if self.config.controls else None
         except (p.NgsError, OSError, TimeoutError) as exc:
             return Snapshot(monotonic=time.monotonic(), error=f"{type(exc).__name__}: {exc}")
 
@@ -470,6 +729,7 @@ class Bench:
             analogs=analogs,
             pwms=pwms,
             status=status,
+            control=control,
         )
 
     # -- lookup ------------------------------------------------------------

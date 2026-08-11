@@ -21,6 +21,16 @@ globally.
 Do not add a `native` PlatformIO env: this machine has no host C compiler,
 which is why the C tests run on-target.
 
+`pio test` sometimes reports **`[PASSED]` with 0 test cases** — that is not a
+pass, it means it could not open the port to read the results (the board is
+still re-enumerating after the upload). Always check the case count. If it
+happens, split the run:
+
+```powershell
+.\.venv\Scripts\pio.exe test -e teensy41 --without-testing
+.\.venv\Scripts\pio.exe test -e teensy41 --without-building --without-uploading --test-port COM3
+```
+
 ## The layering, and why it matters
 
 ```
@@ -73,6 +83,38 @@ that declaration, so there is no second copy to forget.
 - `-std=` and warning flags do not go in `build_flags` — PlatformIO shares
   `CCFLAGS` between gcc and g++, so C-only flags break the C++ build. Warnings
   are scoped in `build_src_flags` and `firmware/lib/ngs/library.json`.
+
+## The control loop
+
+`firmware/lib/ngs/ngs_control.c` runs the closed-loop pump control on the
+device at 50 Hz. It lives in firmware because a loop paced by USB round trips
+inherits the host's scheduling jitter. It touches no hardware — the caller
+reads the ADC and writes the PWM — so it is testable off-target with scripted
+measurements, which is the only practical way to test a controller.
+
+`host/ngs_host/control.py` is a Python mirror of it, so the simulator behaves
+like the board. Duplicated logic drifts, so the two are pinned together by a
+shared numeric vector: the same scenario and the same expected outputs in
+`host/tests/test_control_vector.py` and `test_control_vector()` in
+`firmware/test/test_ngs/test_control.h`. **The C is authoritative** — when they
+disagree, the mirror is wrong. It has already caught one real divergence
+(Python's `statistics.median` averages the two middle samples on an even
+window; the C takes the upper middle).
+
+The device works in mL/min, not counts, so setpoints and gains mean something.
+It gets there from two calibration numbers the host sends; the calibration
+itself still lives in `BENCH_CONFIG`.
+
+Things that look like details and are not:
+
+- Entering AUTO seeds the setpoint ramp on the *first tick*, not at configure
+  time, because the measurement chain only runs while the loop is active.
+- `Bench.stop()` drops the loop to manual before writing the PWM. The device
+  refuses manual writes while the loop owns the output, so without that the
+  emergency stop fails with BUSY.
+- Autotune rejects an experiment whose swing barely clears the hysteresis
+  band. Ku divides by `sqrt(a² - h²)`, so a marginal swing does not give an
+  uncertain gain, it gives an enormous one.
 
 ## Testing without hardware
 

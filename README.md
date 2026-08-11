@@ -167,8 +167,13 @@ rate drops rather than claiming 2 Hz over stale numbers.
 | Command | Effect |
 |---|---|
 | `V1O` `V1C` `V1T` `V1?` | valve 1 open / close / toggle / query |
-| `P50` `P37.5` | pump setpoint, percent |
-| `P+5` `P-5` | nudge the setpoint |
+| `P50` `P37.5` | pump duty, percent (manual mode) |
+| `P+5` `P-5` | nudge the duty |
+| `PA250` | closed loop: hold 250 mL/min |
+| `PM` | back to manual, holding the current duty |
+| `K?` `KP0.16` `KI0.02` `KD0` | show / set the loop gains |
+| `KF1.5` `KB2` | measurement filter seconds / integration deadband |
+| `T240` `T?` `TA` `TX` | autotune / progress / adopt gains / abort |
 | `F?` | read the flow meter |
 | `S` | device status counters |
 | `X` | stop: pump to 0, valves closed |
@@ -191,6 +196,87 @@ with Device.open() as dev:
     bench.set_pwm("pump", 40.0)
     print(bench.read_analog("flow").value, "mL/min")
 ```
+
+## Closed-loop flow control
+
+The pump runs in one of two modes. **Manual** is a duty cycle you set. **Auto**
+holds a flow setpoint in mL/min, with the loop running *on the Teensy* at
+50 Hz — a control loop paced by USB round trips is at the mercy of host
+scheduling, which is the one thing a controller must not have.
+
+```
+PA250;      hold 250 mL/min
+PM;         back to manual, keeping the duty the loop had reached
+```
+
+The transfer is bumpless in both directions: entering auto seeds the
+integrator from the duty already applied and starts the setpoint ramp from the
+flow actually measured, so the pump does not step when the mode changes.
+
+### Dealing with a noisy flow signal
+
+Three things, in the order the signal meets them:
+
+1. **Median of 5** on the raw samples, which removes isolated spikes outright.
+   Ahead of the low-pass on purpose — an IIR filter smears a spike across its
+   whole time constant instead of removing it.
+2. **First-order low-pass**, `KF<seconds>`, default 1 s. The loop is allowed to
+   be slow; a few seconds to correct is fine and stability is worth more.
+3. **Deadband**, `KB<mL/min>`, default 2. Inside it the error is mostly noise,
+   so the integrator holds rather than walking the output around forever.
+
+Derivative gain defaults to **zero**. On a noisy flow signal D amplifies noise
+far more reliably than it improves response. It is configurable if you want it.
+
+### Setpoint changes and windup
+
+A step change is *ramped* (`setpoint_slew`, default 60 mL/min/s) rather than
+applied instantly, so the loop follows a trajectory it can actually track
+instead of an error step that saturates the output and charges the integrator.
+The output has its own rate limit too.
+
+Windup is handled twice over: the integrator only accumulates when doing so
+would not drive further into a limit, *and* the accumulated term is clamped to
+the output range. Conditional integration alone still lets the term sit pinned
+long after the error reverses.
+
+The derivative acts on the measurement, not the error, so a setpoint step
+produces no derivative kick.
+
+### Autotune
+
+```powershell
+.\.venv\Scripts
+gs.exe tune 240 --adopt
+```
+
+Relay feedback (Åström–Hägglund): the output is driven up and down around the
+setpoint until the flow settles into a limit cycle, whose amplitude and period
+give the ultimate gain and period directly — no process model needed, and the
+loop is never deliberately pushed unstable. The hysteresis band keeps the relay
+switching on the process rather than on sensor noise.
+
+Gains come from **Tyreus–Luyben** by default, which is markedly less aggressive
+than Ziegler–Nichols (`--rule ziegler-nichols`, or `pessen` for faster and less
+damped). ZN was derived for quarter-amplitude decay, i.e. for a loop that
+visibly rings; on a bench pump, settling slowly beats oscillating.
+
+It refuses rather than guessing when the experiment was not informative — a
+swing that barely clears the hysteresis band, a period only a few control ticks
+long, or cycles too scattered to average. Those cases do not give a slightly
+uncertain gain, they give a confidently enormous one, because Ku divides by
+`sqrt(a² - h²)`.
+
+**The pump oscillates on purpose during a tune.** Have the flow path open, and
+the command aborts the experiment and stops the pump if it exits for any
+reason.
+
+### If the sensor dies mid-run
+
+A reading below `fault_below` (default −25 mL/min, i.e. under 4 mA) means the
+loop is open, not that the flow is low. Chasing it would ramp the pump to full
+against a sensor that cannot report back, so the controller drops to manual at
+the safe output, latches a fault counter, and makes you re-enable it.
 
 ## Adding hardware
 

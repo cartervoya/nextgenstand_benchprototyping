@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ngs_control.h"
 #include "ngs_link.h"
 
 #ifdef __cplusplus
@@ -43,6 +44,15 @@ typedef struct {
     uint32_t tx_frames;
     uint32_t loop_max_us;
     uint32_t last_poll_us;
+
+    /* Closed-loop pump control. Runs on its own period inside ngs_app_poll,
+     * independent of how often the host talks to us. */
+    NgsControl control;
+    /* Both learned from the last NGS_MSG_WRITE_PWM: the loop drives the pin
+     * the operator was already driving, at the resolution already configured,
+     * so it never has to reprogram the timer. */
+    uint8_t control_pin;
+    uint8_t control_bits;
 } NgsApp;
 
 void ngs_app_init(NgsApp *app);

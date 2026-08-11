@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import protocol as p
+from .control import FakeController
 from .link import Decoder, Frame, encode_frame
 
 #: The firmware's compiled-in resolutions (main.cpp).
@@ -44,6 +45,14 @@ class FakeBoard:
     pin_values: dict[int, int] = field(default_factory=dict)
     pwm: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     pwm_bits: int = PWM_BITS
+
+    #: Set by the control loop to the timestamp of the tick being served, and
+    #: cleared afterwards. A simulated plant behind `adc` should advance on
+    #: this when it is set: the loop replays a burst of ticks on its own clock
+    #: whenever the host does I/O, and a plant advancing on wall time would sit
+    #: frozen through the burst -- which turns any tuning experiment run
+    #: against the simulator into a measurement of the host's poll rate.
+    sim_now_us: int | None = None
 
     adc: Callable[[int], int] = lambda channel: 2048 + channel
 
@@ -76,6 +85,10 @@ class FakeDevice:
         self.stream_seq = 0
         self._stream_next_us = 0
 
+        self.control = FakeController()
+        self.control_pin = 0
+        self.control_bits = 0
+
         # main.cpp logs this from setup(); a host that connects mid-run would
         # not see it, but one that opens the fake from scratch should.
         self._send(p.MsgType.LOG, 0, b"ngs firmware ready")
@@ -88,6 +101,7 @@ class FakeDevice:
         return len(data)
 
     def read(self, size: int = 1) -> bytes:
+        self._poll_control()
         self._poll_stream()
         out = bytes(self._tx[:size])
         del self._tx[: len(out)]
@@ -97,6 +111,7 @@ class FakeDevice:
     def in_waiting(self) -> int:
         """Bytes ready to read, as pyserial reports it. Present so the driver
         takes the same code path here as against a real port."""
+        self._poll_control()
         self._poll_stream()
         return len(self._tx)
 
@@ -137,6 +152,10 @@ class FakeDevice:
             p.MsgType.READ_ADC: self._read_adc,
             p.MsgType.WRITE_PWM: self._write_pwm,
             p.MsgType.SET_STREAM: self._set_stream,
+            p.MsgType.SET_CONTROL: self._set_control,
+            p.MsgType.GET_CONTROL: self._get_control,
+            p.MsgType.AUTOTUNE: self._autotune,
+            p.MsgType.GET_AUTOTUNE: self._get_autotune,
         }.get(frame.type)
 
         if handler is None:
@@ -249,14 +268,96 @@ class FakeDevice:
         if req.pin > p.MAX_DIGITAL_PIN or req.resolution > 16:
             return p.ErrCode.BAD_ARGUMENT
 
+        # The loop owns the output in auto; a manual write would be overwritten
+        # on the next tick. Same refusal the firmware makes.
+        if self.control.mode != p.PumpMode.MANUAL and req.pin == self.control_pin:
+            return p.ErrCode.BUSY
+
         if req.resolution:
             self.board.pwm_bits = req.resolution
         if self.board.pwm_bits < 16 and req.duty >= (1 << self.board.pwm_bits):
             return p.ErrCode.BAD_ARGUMENT
 
         self.board.pwm[req.pin] = (req.duty, req.freq_hz, self.board.pwm_bits)
+        self.control_pin = req.pin
+        if req.resolution:
+            self.control_bits = req.resolution
+        if self.control_bits:
+            full_scale = (1 << self.control_bits) - 1
+            self.control.note_manual_output(req.duty * 100.0 / full_scale)
         self._respond(frame)
         return None
+
+    # -- closed-loop control ----------------------------------------------
+
+    def _set_control(self, frame: Frame) -> p.ErrCode | None:
+        req = self._unpack(p.ControlCfg, frame)
+        if req is None:
+            return p.ErrCode.BAD_PAYLOAD
+        err = self.control.configure(req, self.control.output)
+        if err:
+            return p.ErrCode(err)
+        self._respond(frame)
+        return None
+
+    def _get_control(self, frame: Frame) -> p.ErrCode | None:
+        self._respond(frame, self.control.state().pack())
+        return None
+
+    def _autotune(self, frame: Frame) -> p.ErrCode | None:
+        req = self._unpack(p.AutotuneCmd, frame)
+        if req is None:
+            return p.ErrCode.BAD_PAYLOAD
+        err = self.control.start_autotune(req, self.board.micros(), self.control.output)
+        if err:
+            return p.ErrCode(err)
+        self._respond(frame)
+        return None
+
+    def _get_autotune(self, frame: Frame) -> p.ErrCode | None:
+        self._respond(frame, self.control.autotune_state().pack())
+        return None
+
+    def _poll_control(self) -> None:
+        """The fake's equivalent of app_run_control(), driven from read().
+
+        The firmware polls continuously and ticks the loop every period. This
+        only gets called when the host does I/O -- perhaps twice a second --
+        so it replays the ticks that would have happened in between, feeding
+        each one its scheduled timestamp rather than "now". Without that, the
+        simulated loop would run hundreds of times slower than the real one and
+        every tuning experiment done against it would be meaningless.
+        """
+        if self.control.mode == p.PumpMode.MANUAL or not self.control_bits:
+            return
+
+        now = self.board.micros()
+        full_scale = (1 << self.control_bits) - 1
+
+        for _ in range(500):  # bounded: a long stall must not hang the caller
+            due = self.control.next_us
+            when = now if due == 0 else due
+            if when > now:
+                break
+
+            self.board.sim_now_us = when
+            try:
+                raw = int(self.board.adc(self.control.cfg.channel))
+            finally:
+                self.board.sim_now_us = None
+
+            output = self.control.tick(when, raw)
+            if output is None:
+                if due == 0:
+                    continue  # the priming pass
+                break
+
+            duty = int(output / 100.0 * full_scale + 0.5)
+            freq = self.board.pwm.get(self.control_pin, (0, 0, 0))[1]
+            self.board.pwm[self.control_pin] = (duty, freq, self.control_bits)
+
+            if self.control.mode == p.PumpMode.MANUAL:
+                break  # a fault or a finished autotune handed the pump back
 
     def _set_stream(self, frame: Frame) -> p.ErrCode | None:
         req = self._unpack(p.StreamCfg, frame)

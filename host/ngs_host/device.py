@@ -353,6 +353,28 @@ class Device:
                 raise ValueError(f"channel mask 0x{mask:X} exceeds A{p.MAX_ADC_CHANNEL}")
         self._transact(p.MsgType.SET_STREAM, p.StreamCfg(int(enable), period_us, mask).pack())
 
+    # -- closed-loop control -----------------------------------------------
+
+    def set_control(self, cfg: p.ControlCfg) -> None:
+        """Push a whole controller configuration.
+
+        Whole, not incremental: a partial update would need a field mask on the
+        wire, and re-sending eleven floats costs less than a millisecond.
+        """
+        self._transact(p.MsgType.SET_CONTROL, cfg.pack())
+
+    def control(self) -> p.ControlState:
+        """What the loop is doing right now, including the split P/I/D terms."""
+        return p.ControlState.unpack(self._transact(p.MsgType.GET_CONTROL))
+
+    def autotune(self, cmd: p.AutotuneCmd) -> None:
+        """Start or abort a relay autotune. Returns as soon as the device has
+        accepted it -- poll `autotune_result()` for progress."""
+        self._transact(p.MsgType.AUTOTUNE, cmd.pack())
+
+    def autotune_result(self) -> p.AutotuneResult:
+        return p.AutotuneResult.unpack(self._transact(p.MsgType.GET_AUTOTUNE))
+
     # -- telemetry ---------------------------------------------------------
 
     def stream(

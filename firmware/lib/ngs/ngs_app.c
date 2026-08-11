@@ -172,11 +172,78 @@ static int handle_write_pwm(NgsApp *app, const NgsFrame *req)
     NgsPwmWritePayload p;
     memcpy(&p, req->payload, sizeof(p));
 
+    /* A manual write while the loop owns the output would be overwritten on
+     * the next tick anyway. Refusing is clearer than a setpoint that appears
+     * to take and then silently reverts. */
+    if (app->control.mode != NGS_PUMP_MODE_MANUAL && p.pin == app->control_pin) {
+        return NGS_ERR_BUSY;
+    }
+
     int err = ngs_board_pwm_write(p.pin, p.duty, p.freq_hz, p.resolution);
     if (err != 0) {
         return err;
     }
+
+    /* Remember the pin and the level, so switching to AUTO knows which output
+     * it owns and can pick up from where manual left it. */
+    app->control_pin = p.pin;
+    if (p.resolution > 0u && p.resolution <= 16u) {
+        app->control_bits = p.resolution;
+    }
+    if (app->control_bits > 0u) {
+        float full_scale = (float)((1u << app->control_bits) - 1u);
+        ngs_control_note_manual_output(&app->control, (float)p.duty * 100.0f / full_scale);
+    }
+
     app_send_ack(app, req);
+    return 0;
+}
+
+static int handle_set_control(NgsApp *app, const NgsFrame *req)
+{
+    if (req->len != sizeof(NgsControlCfgPayload)) {
+        return NGS_ERR_BAD_PAYLOAD;
+    }
+    NgsControlCfgPayload p;
+    memcpy(&p, req->payload, sizeof(p));
+
+    int err = ngs_control_configure(&app->control, &p, app->control.output);
+    if (err != 0) {
+        return err;
+    }
+    app_send_ack(app, req);
+    return 0;
+}
+
+static int handle_get_control(NgsApp *app, const NgsFrame *req)
+{
+    NgsControlStatePayload st;
+    ngs_control_get_state(&app->control, &st);
+    app_send(app, (uint8_t)(req->type | NGS_MSG_RESP), req->seq, &st, sizeof(st));
+    return 0;
+}
+
+static int handle_autotune(NgsApp *app, const NgsFrame *req)
+{
+    if (req->len != sizeof(NgsAutotuneCmdPayload)) {
+        return NGS_ERR_BAD_PAYLOAD;
+    }
+    NgsAutotuneCmdPayload p;
+    memcpy(&p, req->payload, sizeof(p));
+
+    int err = ngs_control_autotune(&app->control, &p, ngs_board_micros(), app->control.output);
+    if (err != 0) {
+        return err;
+    }
+    app_send_ack(app, req);
+    return 0;
+}
+
+static int handle_get_autotune(NgsApp *app, const NgsFrame *req)
+{
+    NgsAutotuneResultPayload res;
+    ngs_control_get_autotune(&app->control, &res);
+    app_send(app, (uint8_t)(req->type | NGS_MSG_RESP), req->seq, &res, sizeof(res));
     return 0;
 }
 
@@ -237,6 +304,10 @@ static void app_dispatch(NgsApp *app, const NgsFrame *req)
     case NGS_MSG_READ_ADC:   err = handle_read_adc(app, req); break;
     case NGS_MSG_WRITE_PWM:  err = handle_write_pwm(app, req); break;
     case NGS_MSG_SET_STREAM: err = handle_set_stream(app, req); break;
+    case NGS_MSG_SET_CONTROL: err = handle_set_control(app, req); break;
+    case NGS_MSG_GET_CONTROL: err = handle_get_control(app, req); break;
+    case NGS_MSG_AUTOTUNE:    err = handle_autotune(app, req); break;
+    case NGS_MSG_GET_AUTOTUNE: err = handle_get_autotune(app, req); break;
     default:                 err = NGS_ERR_UNKNOWN_TYPE; break;
     }
 
@@ -288,7 +359,39 @@ void ngs_app_init(NgsApp *app)
 {
     memset(app, 0, sizeof(*app));
     ngs_decoder_init(&app->decoder);
+    ngs_control_init(&app->control);
     app->last_poll_us = ngs_board_micros();
+}
+
+/* Runs the control loop if it is due. Split out of ngs_app_poll to keep the
+ * poll readable: this is the only place the loop touches hardware. */
+static void app_run_control(NgsApp *app, uint32_t now)
+{
+    if (app->control.mode == NGS_PUMP_MODE_MANUAL) {
+        return;
+    }
+
+    uint16_t raw = 0;
+    uint8_t resolution = 0;
+    if (ngs_board_adc_read(app->control.cfg.channel, 1, &raw, &resolution) != 0) {
+        return; /* bad channel: configure() already rejected it, so this is a
+                 * hardware failure, not a configuration one */
+    }
+
+    float output = 0.0f;
+    if (!ngs_control_tick(&app->control, now, raw, &output)) {
+        return;
+    }
+
+    /* Duty at the resolution the pin is already configured for. Frequency and
+     * resolution are left alone: the loop changes the level, never the
+     * carrier -- reprogramming the timer every tick would glitch the output
+     * thousands of times a second. */
+    if (app->control_bits == 0u) {
+        return; /* nothing has configured the pin yet; nothing to drive */
+    }
+    uint16_t duty = (uint16_t)((output / 100.0f) * (float)((1u << app->control_bits) - 1u) + 0.5f);
+    (void)ngs_board_pwm_write(app->control_pin, duty, 0, 0);
 }
 
 void ngs_app_poll(NgsApp *app)
@@ -317,6 +420,8 @@ void ngs_app_poll(NgsApp *app)
             app_send_error(app, app->decoder.last_error, 0, 0);
         }
     }
+
+    app_run_control(app, now);
 
     if (app->stream_enabled) {
         /* Signed difference so the comparison survives the micros() wrap. */

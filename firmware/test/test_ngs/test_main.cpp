@@ -21,6 +21,10 @@ extern "C" {
 #include "ngs_protocol.h"
 }
 
+/* The controller tests live in their own header: they need a plant model and
+ * long simulated runs, which would swamp this file. */
+#include "test_control.h"
+
 static NgsApp app;
 
 void setUp(void)
@@ -650,6 +654,8 @@ void setup()
     RUN_TEST(test_stream_disable_stops_records);
     RUN_TEST(test_blocked_tx_does_not_wedge_polling);
     RUN_TEST(test_multiple_frames_in_one_poll);
+
+    register_control_tests();
 
     UNITY_END();
 }

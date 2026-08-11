@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from . import protocol as p
 from .bench import Bench, Snapshot, ValveReading
 from .commands import CommandResult, execute_line, help_text
 from .keyboard import LineEditor, raw_mode, read_keys, stdin_is_interactive
@@ -51,14 +52,24 @@ def render_channels(snapshot: Snapshot) -> Table:
     table.add_column("value", justify="right", min_width=18)
     table.add_column("detail", style="dim")
 
+    control = snapshot.control
     for reading in snapshot.pwms.values():
         spec = reading.spec
-        table.add_row(
-            spec.code,
-            spec.description,
-            Text(reading.text, style="cyan"),
-            f"pin {spec.pin}, {spec.freq_hz / 1000:g} kHz, {spec.resolution}-bit",
-        )
+        detail = f"pin {spec.pin}, {spec.freq_hz / 1000:g} kHz, {spec.resolution}-bit"
+        value = Text(reading.text, style="cyan")
+
+        if control is not None and control.mode != p.PumpMode.MANUAL:
+            # In auto the duty is an outcome, not a setting -- what the operator
+            # asked for is the setpoint, so lead with that.
+            value = Text.assemble(
+                (f"{control.setpoint_target:.0f} ", "bold cyan"),
+                (control.mode_name, "bold magenta"),
+                (f"  ({reading.percent:.1f} %)", "dim"),
+            )
+            detail = f"measured {control.measurement:.1f}, error {control.error:+.1f}"
+            if control.slewing:
+                detail += f", ramping through {control.setpoint:.0f}"
+        table.add_row(spec.code, spec.description, value, detail)
 
     for reading in snapshot.valves.values():
         spec = reading.spec
@@ -79,6 +90,39 @@ def render_channels(snapshot: Snapshot) -> Table:
         )
 
     return table
+
+
+def render_loop(snapshot: Snapshot) -> Text:
+    """One line describing the closed loop, or nothing when it is idle.
+
+    The split P/I terms are the difference between "the output is 48 %" and
+    "the integrator is carrying it, the error is nearly zero" -- which is what
+    you need while tuning.
+    """
+    control = snapshot.control
+    if control is None or control.mode == p.PumpMode.MANUAL:
+        if control is not None and control.fault_count:
+            return Text(
+                f"loop: manual  (dropped out on a sensor fault {control.fault_count}x)",
+                style="yellow",
+            )
+        return Text()
+
+    flags = control.flag_names()
+    style = "red" if control.faulted else ("yellow" if flags else "magenta")
+    parts = [
+        f"loop: {control.mode_name}",
+        f"sp {control.setpoint_target:.1f}",
+        f"meas {control.measurement:.1f}",
+        f"err {control.error:+.1f}",
+        f"P {control.p_term:+.2f}",
+        f"I {control.i_term:+.2f}",
+    ]
+    if control.d_term:
+        parts.append(f"D {control.d_term:+.2f}")
+    if flags:
+        parts.append("[" + " ".join(flags) + "]")
+    return Text("  ".join(parts), style=style)
 
 
 def _valve_style(reading: ValveReading) -> str:
@@ -129,6 +173,7 @@ def render(
         render_status(snapshot, port=port, fw=fw, poll_hz=poll_hz),
         Text(),
         render_channels(snapshot),
+        render_loop(snapshot),
         Text(),
         *[Text(line.text, style="" if line.ok else "red") for line in log[-LOG_LINES:]],
         Text(),
