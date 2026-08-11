@@ -254,8 +254,7 @@ host-side stop can never cover, because by then the host is the thing that
 failed. The dashboards switch it on while they are supervising:
 
 ```powershell
-.\.venv\Scripts
-gs.exe bench --watchdog 3000    # latch after 3 s of silence
+.\.venv\Scripts\ngs.exe bench --watchdog 3000    # latch after 3 s of silence
 ```
 
 It is **off by default**, and deliberately so: a watchdog that fires whenever
@@ -312,8 +311,7 @@ produces no derivative kick.
 ### Autotune
 
 ```powershell
-.\.venv\Scripts
-gs.exe tune 240 --adopt
+.\.venv\Scripts\ngs.exe tune 240 --adopt
 ```
 
 Relay feedback (Åström–Hägglund): the output is driven up and down around the
