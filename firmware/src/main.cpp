@@ -9,6 +9,7 @@
  */
 
 #include <Arduino.h>
+#include <EEPROM.h>
 
 extern "C" {
 #include "ngs_app.h"
@@ -190,6 +191,32 @@ int ngs_board_pwm_write(uint8_t pin, uint16_t duty, uint32_t freq_hz, uint8_t re
     }
     analogWrite(pin, duty);
     return 0;
+}
+
+/* Teensyduino emulates EEPROM in program flash: 4284 bytes on a 4.1, wear
+ * levelled across 63 sectors. EEPROM.update() only touches a byte that has
+ * actually changed, which is what keeps re-saving an unchanged configuration
+ * from costing flash endurance. */
+bool ngs_board_nvm_read(uint32_t offset, uint8_t *data, uint32_t len)
+{
+    if (offset + len > (uint32_t)E2END + 1u) {
+        return false;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        data[i] = EEPROM.read((int)(offset + i));
+    }
+    return true;
+}
+
+bool ngs_board_nvm_write(uint32_t offset, const uint8_t *data, uint32_t len)
+{
+    if (offset + len > (uint32_t)E2END + 1u) {
+        return false;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        EEPROM.update((int)(offset + i), data[i]);
+    }
+    return true;
 }
 
 void ngs_board_led(int on)

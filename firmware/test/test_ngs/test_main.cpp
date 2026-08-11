@@ -72,6 +72,7 @@ static bool round_trip(uint8_t type, uint8_t seq, const void *payload, uint16_t 
 /* The emergency stop tests use the helpers above, so they are included
  * here rather than at the top of the file. */
 #include "test_estop.h"
+#include "test_store.h"
 
 /* ---- CRC --------------------------------------------------------------- */
 
@@ -662,6 +663,7 @@ void setup()
 
     register_control_tests();
     register_estop_tests();
+    register_store_tests();
 
     UNITY_END();
 }

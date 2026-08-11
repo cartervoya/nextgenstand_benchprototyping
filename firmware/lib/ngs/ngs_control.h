@@ -81,8 +81,16 @@ typedef struct {
     float troughs[NGS_AT_MAX_CYCLES];  /* min while the relay was low  */
     uint8_t cycles;
 
-    float peak_acc;   /* running extreme within the current half-cycle */
+    float peak_acc;   /* running extreme within the current cycle */
     float trough_acc;
+
+    /* Settle phase: hold the bias, let the process stop moving, and watch how
+     * much the reading wanders while it does. That wander is the noise floor,
+     * and it is what the relay band has to clear. */
+    uint32_t settle_us;
+    float settle_min;
+    float settle_max;
+    float noise;
 
     /* Results, valid once state == NGS_AT_DONE. */
     float ku;
@@ -117,6 +125,11 @@ typedef struct {
 
     /* Loop state. */
     float setpoint_active;
+    /* Demand, 0-100 %, before the deadzone mapping. The loop reasons in this
+     * space -- limits, integral, slew -- and only the emitted duty is mapped,
+     * so a pump that does nothing below 20 % does not appear to the controller
+     * as a fifth of its range being dead. */
+    float demand;
     float integral;
     float last_measurement;
     float output;

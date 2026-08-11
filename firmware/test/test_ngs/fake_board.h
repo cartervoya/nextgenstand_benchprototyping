@@ -38,6 +38,12 @@ typedef struct {
     uint8_t adc_last_samples;
     uint8_t adc_last_channel;
 
+    /* Stand-in for the EEPROM emulation. `nvm_fail` lets a test check that a
+     * refused write is reported rather than assumed to have worked. */
+    uint8_t nvm[256];
+    bool nvm_fail;
+    uint32_t nvm_writes;
+
     uint8_t pwm_pin;
     uint16_t pwm_duty;
     uint32_t pwm_freq;

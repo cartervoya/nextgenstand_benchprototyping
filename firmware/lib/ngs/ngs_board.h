@@ -14,6 +14,7 @@
 #ifndef NGS_BOARD_H
 #define NGS_BOARD_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -52,6 +53,13 @@ int ngs_board_adc_read(uint8_t channel, uint8_t samples, uint16_t *raw_out, uint
 /* Analog out. freq_hz == 0 leaves the frequency alone; resolution == 0 leaves
  * the resolution alone. */
 int ngs_board_pwm_write(uint8_t pin, uint16_t duty, uint32_t freq_hz, uint8_t resolution);
+
+/* Non-volatile storage. Byte-addressed, `len` bytes at `offset`; both return
+ * false if the region cannot be reached. On the Teensy this is Teensyduino's
+ * EEPROM emulation, which is flash with wear levelling underneath -- so write
+ * only when something has actually changed, not on a timer. */
+bool ngs_board_nvm_read(uint32_t offset, uint8_t *data, uint32_t len);
+bool ngs_board_nvm_write(uint32_t offset, const uint8_t *data, uint32_t len);
 
 void ngs_board_led(int on);
 void ngs_board_reset(void); /* does not return */

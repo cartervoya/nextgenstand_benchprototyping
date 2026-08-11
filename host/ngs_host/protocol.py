@@ -21,7 +21,7 @@ from typing import ClassVar
 # Constants
 # --------------------------------------------------------------------------
 
-PROTO_VERSION = 3
+PROTO_VERSION = 4
 MAX_PAYLOAD = 512
 
 #: OR'd onto a request type to form the response type.
@@ -55,6 +55,8 @@ class MsgType(IntEnum):
     GET_CONTROL = 0x31
     AUTOTUNE = 0x32
     GET_AUTOTUNE = 0x33
+    GET_CONTROL_CFG = 0x34
+    STORE_CONTROL = 0x35
 
     LOG = 0xF0
     TELEMETRY = 0xF1
@@ -405,6 +407,25 @@ class EstopSource(IntEnum):
     WATCHDOG = 0x02
 
 
+class StoreAction(IntEnum):
+    """NGS_STORE_ACTION_* -- writing NVM is explicit, never automatic: the
+    store is emulated in flash and has a finite erase budget."""
+
+    SAVE = 0x01
+    ERASE = 0x02
+
+
+@dataclass(slots=True)
+class StoreCmd(Payload):
+    C_NAME = "NgsStoreCmdPayload"
+    FIELDS = (
+        ("uint8_t", "action"),
+        ("uint8_t[3]", "_pad"),
+    )
+
+    action: int = StoreAction.SAVE
+
+
 class SafeKind(IntEnum):
     GPIO = 0x00
     PWM = 0x01
@@ -523,6 +544,7 @@ class ControlCfg(Payload):
         ("float", "deadband"),
         ("float", "setpoint_slew"),
         ("float", "output_slew"),
+        ("float", "out_deadzone"),
         ("float", "cal_scale"),
         ("float", "cal_offset"),
         ("float", "fault_below"),
@@ -542,6 +564,9 @@ class ControlCfg(Payload):
     deadband: float = 0.0
     setpoint_slew: float = 60.0
     output_slew: float = 25.0
+    #: Duty below which the pump does not move. The loop maps its 0-100 %
+    #: demand onto this..100 %, so it never has to wind across a dead band.
+    out_deadzone: float = 0.0
     cal_scale: float = 1.0
     cal_offset: float = 0.0
     fault_below: float = 0.0
@@ -555,7 +580,7 @@ class ControlState(Payload):
         ("uint8_t", "mode"),
         ("uint8_t", "flags"),
         ("uint8_t", "autotune_state"),
-        ("uint8_t", "_pad"),
+        ("uint8_t", "stored"),
         ("float", "setpoint"),
         ("float", "setpoint_target"),
         ("float", "measurement"),
@@ -571,6 +596,8 @@ class ControlState(Payload):
     mode: int
     flags: int
     autotune_state: int
+    #: 1 when the board holds a saved configuration in NVM.
+    stored: int
     setpoint: float
     setpoint_target: float
     measurement: float
@@ -624,6 +651,7 @@ class AutotuneCmd(Payload):
         ("float", "setpoint"),
         ("float", "amplitude"),
         ("float", "hysteresis"),
+        ("uint32_t", "settle_ms"),
         ("uint32_t", "timeout_ms"),
     )
 
@@ -632,7 +660,13 @@ class AutotuneCmd(Payload):
     rule: int = TuningRule.TYREUS_LUYBEN
     setpoint: float = 0.0
     amplitude: float = 10.0
+    #: 0 asks the device to size the band from the noise it measures during
+    #: the settle phase -- what you want on a signal you have not
+    #: characterised, which is most of them.
     hysteresis: float = 0.0
+    #: Time holding the bias before the relay starts: lets the process settle,
+    #: and is when the noise is measured.
+    settle_ms: int = 3_000
     timeout_ms: int = 120_000
 
 
@@ -651,6 +685,8 @@ class AutotuneResult(Payload):
         ("float", "ki"),
         ("float", "kd"),
         ("float", "spread"),
+        ("float", "noise"),
+        ("float", "hysteresis"),
     )
 
     state: int
@@ -664,6 +700,10 @@ class AutotuneResult(Payload):
     ki: float
     kd: float
     spread: float
+    #: Peak-to-peak sensor noise measured during the settle phase.
+    noise: float = 0.0
+    #: The relay band actually used, whether given or derived from the noise.
+    hysteresis: float = 0.0
 
     @property
     def state_name(self) -> str:
@@ -759,4 +799,5 @@ RESPONSE_PAYLOAD: dict[int, type[Payload]] = {
     MsgType.READ_ADC: AdcRead,
     MsgType.GET_CONTROL: ControlState,
     MsgType.GET_AUTOTUNE: AutotuneResult,
+    MsgType.GET_CONTROL_CFG: ControlCfg,
 }

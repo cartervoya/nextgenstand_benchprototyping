@@ -36,8 +36,11 @@ extern "C" {
  *
  * v2 added the closed-loop pump controller (0x30..0x33) and its payloads.
  * v3 added the emergency stop, its safe-state table, and the host-silence
- *    watchdog; NgsStatusPayload grew the latch state. */
-#define NGS_PROTO_VERSION 3
+ *    watchdog; NgsStatusPayload grew the latch state.
+ * v4 made the device the authority on its own tuning: the control config is
+ *    stored in NVM and read back with GET_CONTROL_CFG, and the config gained
+ *    the pump deadzone. */
+#define NGS_PROTO_VERSION 4
 
 /* Largest payload either side will emit or accept. Keeps every buffer static. */
 #define NGS_MAX_PAYLOAD 512u
@@ -72,6 +75,8 @@ extern "C" {
 #define NGS_MSG_GET_CONTROL 0x31u /* -> (empty) <- NgsControlStatePayload     */
 #define NGS_MSG_AUTOTUNE 0x32u    /* -> NgsAutotuneCmdPayload <- (empty)      */
 #define NGS_MSG_GET_AUTOTUNE 0x33u /* -> (empty) <- NgsAutotuneResultPayload  */
+#define NGS_MSG_GET_CONTROL_CFG 0x34u /* -> (empty) <- NgsControlCfgPayload   */
+#define NGS_MSG_STORE_CONTROL 0x35u   /* -> NgsStoreCmdPayload <- (empty)     */
 
 #define NGS_MSG_LOG 0xF0u       /* <- ASCII text, no NUL terminator          */
 #define NGS_MSG_TELEMETRY 0xF1u /* <- NgsTelemetryPayload                    */
@@ -309,6 +314,11 @@ typedef struct NGS_PACKED {
     float deadband;     /* units; no integration while |error| is under it   */
     float setpoint_slew; /* units/s, 0 = step immediately                    */
     float output_slew;  /* %/s, 0 = unlimited                                */
+    /* Duty below which the pump does not move at all. The controller maps its
+     * 0-100 % demand onto deadzone..100 %, so the loop sees something close to
+     * linear instead of a flat region it can only escape by winding up. 0
+     * disables the mapping. */
+    float out_deadzone;
     float cal_scale;    /* units per ADC count                               */
     float cal_offset;   /* ADC counts reading zero units                     */
     /* Units; below this the sensor is considered dead. Signed and enabled by
@@ -326,7 +336,7 @@ typedef struct NGS_PACKED {
     uint8_t mode;
     uint8_t flags;          /* NGS_CTRL_FLAG_*                               */
     uint8_t autotune_state; /* NGS_AT_*                                      */
-    uint8_t _pad;
+    uint8_t stored;         /* 1 when NVM holds a valid config               */
     float setpoint;         /* the slew-limited setpoint actually in use     */
     float setpoint_target;  /* what was last commanded                       */
     float measurement;      /* filtered                                      */
@@ -360,8 +370,14 @@ typedef struct NGS_PACKED {
     uint8_t _pad;
     float setpoint;   /* operating point to oscillate about                  */
     float amplitude;  /* relay step, % output, either side of the bias       */
-    float hysteresis; /* units; must clear the sensor noise or the relay will
-                       * chatter on noise instead of on the process          */
+    /* Units. Must clear the sensor noise or the relay switches on noise
+     * instead of on the process. 0 asks the device to size it from the noise
+     * it measures during the settle phase, which is what you want on a signal
+     * whose noise you have not characterised. */
+    float hysteresis;
+    /* Time spent holding the bias output before the relay starts: lets the
+     * process settle, and is when the noise above is measured. */
+    uint32_t settle_ms;
     uint32_t timeout_ms;
 } NgsAutotuneCmdPayload;
 
@@ -392,7 +408,20 @@ typedef struct NGS_PACKED {
     float kd;
     float spread;   /* worst period deviation, as a fraction -- how much to
                      * trust the numbers above                               */
+    float noise;    /* measured peak-to-peak sensor noise, units             */
+    float hysteresis; /* band actually used, whether given or derived        */
 } NgsAutotuneResultPayload;
+
+#define NGS_STORE_ACTION_SAVE 0x01u
+#define NGS_STORE_ACTION_ERASE 0x02u
+
+/* NGS_MSG_STORE_CONTROL. Writing is explicit rather than automatic on every
+ * change: the NVM is emulated in flash with a finite erase budget, and a host
+ * that saved on every keystroke would spend it. */
+typedef struct NGS_PACKED {
+    uint8_t action; /* NGS_STORE_ACTION_*                                    */
+    uint8_t _pad[3];
+} NgsStoreCmdPayload;
 
 /* NGS_MSG_ERROR payload. `seq` and `type` identify the request that failed,
  * so a host with several requests in flight can attribute the failure. */

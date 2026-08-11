@@ -134,6 +134,25 @@ int ngs_board_pwm_write(uint8_t pin, uint16_t duty, uint32_t freq_hz, uint8_t re
     return 0;
 }
 
+bool ngs_board_nvm_read(uint32_t offset, uint8_t *data, uint32_t len)
+{
+    if (offset + len > sizeof(g_fake.nvm)) {
+        return false;
+    }
+    memcpy(data, &g_fake.nvm[offset], len);
+    return true;
+}
+
+bool ngs_board_nvm_write(uint32_t offset, const uint8_t *data, uint32_t len)
+{
+    if (g_fake.nvm_fail || offset + len > sizeof(g_fake.nvm)) {
+        return false;
+    }
+    memcpy(&g_fake.nvm[offset], data, len);
+    g_fake.nvm_writes++;
+    return true;
+}
+
 void ngs_board_led(int on)
 {
     g_fake.led = on ? 1 : 0;

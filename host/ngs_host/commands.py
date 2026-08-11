@@ -297,9 +297,19 @@ def _tuning_text(cfg) -> str:
 
 
 def _show_tuning(bench: Bench, _arg: str = "") -> CommandResult:
+    """Gains, and where they came from.
+
+    The source matters: firmware defaults and a two-minute autotune look
+    identical as numbers, and only one of them describes this rig.
+    """
     if not bench.config.controls:
         raise CommandError("no control loop is configured")
-    return CommandResult(True, _tuning_text(bench.control_cfg()))
+
+    text = _tuning_text(bench.control_cfg())
+    record = bench.loaded_tuning
+    if record is not None:
+        text += f"\n  from: {record.source}"
+    return CommandResult(True, text)
 
 
 def _filter_command(bench: Bench, arg: str) -> CommandResult:

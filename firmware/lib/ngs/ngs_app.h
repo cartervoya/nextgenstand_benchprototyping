@@ -67,6 +67,9 @@ typedef struct {
      * so it never has to reprogram the timer. */
     uint8_t control_pin;
     uint8_t control_bits;
+    /* Whether NVM currently holds a valid configuration, reported to the host
+     * so it can tell "the board's tuning" from "the board's defaults". */
+    bool control_stored;
 } NgsApp;
 
 void ngs_app_init(NgsApp *app);

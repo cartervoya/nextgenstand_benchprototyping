@@ -1,0 +1,4 @@
+{
+  "_comment": "Tuning per board, keyed by MCU serial. Written by ngs; safe to edit, commit, and review in a diff.",
+  "boards": {}
+}

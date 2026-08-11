@@ -1,27 +1,18 @@
-"""Persisted tuning: the gains survive closing the terminal.
+"""A record of what the tuning was, and when.
 
-An autotune takes a couple of minutes of the pump oscillating on purpose. Its
-result living only in the process that ran it means doing that again every
-session, which is both tedious and a reason not to bother tuning properly.
+The tuning itself lives on the board -- see ngs_store.c. This file is the
+history: written whenever gains change, never read back as configuration.
 
-Where it lives, and why here rather than on the board:
+That split is the point. One authority means you cannot end up running gains
+you did not choose because a stale file from another rig happened to be in the
+checkout. But a value in flash cannot be reviewed, so "kp went from 0.16 to
+0.31 on the 12th, from an autotune with Ku 0.52" would be unanswerable without
+something that diffs. This is that something.
 
-  - Tuning is bench configuration, and in this project bench configuration
-    lives on the host, under version control, next to the calibration it
-    depends on. Gains are only meaningful against a particular pump, line and
-    flow meter -- exactly the things BENCH_CONFIG describes.
-  - A JSON file diffs. "kp went from 0.16 to 0.31 on the 12th" is a question
-    you can answer from git; EEPROM cannot be reviewed, and a board swap takes
-    its contents with it.
-  - The device is handed its configuration before the loop is ever enabled, so
-    it has no use for a copy of its own.
+Keyed by MCU serial, so the history of two boards on one bench stays separate.
 
-The board's EEPROM would be the right home for a machine expected to run
-standalone. This one does not: the loop only runs while a host is driving it.
-
-Keyed by MCU serial, because gains belong to a rig rather than to whoever is
-sitting in front of it -- and a second Teensy on the bench should not silently
-inherit the first one's tuning.
+Every failure mode here ends in "carry on" -- a read-only checkout costs you
+the history, not the session, because the tuning is on the board either way.
 """
 
 from __future__ import annotations
@@ -35,16 +26,18 @@ from typing import Any
 
 from . import protocol as p
 
-#: Fields worth keeping. Everything here describes how the loop *behaves*.
+#: Which fields count as "tuning" -- used both for what is read back from the
+#: board and for what is recorded here. Everything in it describes how the loop
+#: *behaves*.
 #:
 #: Deliberately excluded: mode and setpoint, which are what the bench is doing
-#: right now rather than how it is tuned. Restoring those on connect would
-#: mean opening a terminal could start the pump, which is not a thing a
-#: configuration file should be able to do. Also excluded is the calibration,
-#: which belongs to BENCH_CONFIG and would be dangerous to shadow here.
-#: Of those, the ones that are not floats. Casting everything to float would
-#: hand the packer a float where the wire format wants a uint32, which fails
-#: at pack() time rather than at load time -- a long way from the cause.
+#: right now rather than how it is tuned, and the calibration, which describes
+#: the wiring and belongs to BENCH_CONFIG. A stored copy of either would be
+#: able to start a pump or silently rescale every reading.
+#:
+#: INT_FIELDS are the ones that are not floats. Casting everything to float
+#: hands the packer a float where the wire format wants a uint32, which fails
+#: inside pack() -- a long way from the cause.
 INT_FIELDS = frozenset({"period_us"})
 
 TUNED_FIELDS = (
@@ -55,6 +48,7 @@ TUNED_FIELDS = (
     "deadband",
     "setpoint_slew",
     "output_slew",
+    "out_deadzone",
     "out_min",
     "out_max",
     "period_us",

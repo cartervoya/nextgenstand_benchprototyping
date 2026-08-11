@@ -51,6 +51,40 @@ static bool elapsed(uint32_t now, uint32_t deadline)
     return (int32_t)(now - deadline) >= 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Pump deadzone
+ *
+ * A diaphragm pump does nothing at all until its drive clears some threshold,
+ * and then behaves roughly linearly above it. Left alone, the controller sees
+ * that flat region as gain it cannot find: at low setpoints the integral winds
+ * across the dead band looking for a response, overshoots the moment the pump
+ * starts, and hunts.
+ *
+ * Mapping demand onto [deadzone, 100] costs nothing and removes the whole
+ * problem. Demand of exactly zero still emits zero -- "off" has to stay off,
+ * or the pump idles whenever the loop asks for nothing.
+ * ------------------------------------------------------------------------ */
+static float apply_deadzone(const NgsControlCfgPayload *cfg, float demand)
+{
+    if (cfg->out_deadzone <= 0.0f || demand <= 0.0f) {
+        return demand;
+    }
+    return cfg->out_deadzone + demand * (100.0f - cfg->out_deadzone) / 100.0f;
+}
+
+/* The inverse, for working out what demand a duty already applied represents --
+ * which is what makes the transfer into AUTO bumpless when a deadzone is set. */
+static float remove_deadzone(const NgsControlCfgPayload *cfg, float duty)
+{
+    if (cfg->out_deadzone <= 0.0f || duty <= 0.0f) {
+        return duty;
+    }
+    if (duty <= cfg->out_deadzone) {
+        return 0.0f;
+    }
+    return (duty - cfg->out_deadzone) * 100.0f / (100.0f - cfg->out_deadzone);
+}
+
 float ngs_control_convert(const NgsControlCfgPayload *cfg, uint16_t raw)
 {
     return ((float)raw - cfg->cal_offset) * cfg->cal_scale;
@@ -133,6 +167,7 @@ void ngs_control_defaults(NgsControlCfgPayload *cfg)
     cfg->deadband = 0.0f;
     cfg->setpoint_slew = 60.0f; /* units/s */
     cfg->output_slew = 25.0f;   /* %/s: full travel in four seconds          */
+    cfg->out_deadzone = 0.0f; /* set it from a measured pump curve */
     cfg->cal_scale = 1.0f;
     cfg->cal_offset = 0.0f;
     cfg->fault_below = 0.0f;
@@ -171,6 +206,9 @@ static int validate(const NgsControlCfgPayload *cfg)
     if (cfg->filter_tau_s < 0.0f || cfg->deadband < 0.0f) {
         return NGS_ERR_BAD_ARGUMENT;
     }
+    if (cfg->out_deadzone < 0.0f || cfg->out_deadzone >= 100.0f) {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
     if (cfg->cal_scale == 0.0f) {
         return NGS_ERR_BAD_ARGUMENT; /* every reading would be zero units */
     }
@@ -200,7 +238,8 @@ int ngs_control_configure(NgsControl *c, const NgsControlCfgPayload *cfg, float 
              * reproduces the output already applied. Without this the pump
              * jumps to whatever P alone says the moment auto is engaged. */
             c->output = current_output;
-            c->integral = current_output;
+            c->demand = remove_deadzone(cfg, current_output);
+            c->integral = c->demand;
             /* Deliberately NOT seeding setpoint_active from c->measurement
              * here: it holds whatever was last read while the loop was
              * running, which may be minutes old or zero. See seed_setpoint. */
@@ -311,9 +350,11 @@ static void run_pid(NgsControl *c, float dt, float *output_pct)
     }
 
     /* Rate-limit the actuator too: a pump asked to jump 0->100 % draws a
-     * current spike the bench supply may not enjoy. */
-    c->output = slew(c->output, limited, cfg->output_slew * dt);
-    c->output = clampf(c->output, cfg->out_min, cfg->out_max);
+     * current spike the bench supply may not enjoy. Slewed in demand space so
+     * the limit means the same thing whatever the deadzone is. */
+    c->demand = slew(c->demand, limited, cfg->output_slew * dt);
+    c->demand = clampf(c->demand, cfg->out_min, cfg->out_max);
+    c->output = apply_deadzone(cfg, c->demand);
     *output_pct = c->output;
 }
 
@@ -438,6 +479,56 @@ static void autotune_finish(NgsControl *c)
     at->fail_reason = NGS_AT_FAIL_NONE;
 }
 
+/* Holds the bias output and watches the reading wander.
+ *
+ * Two jobs at once: give the process time to stop moving, so the first cycle
+ * is a limit cycle rather than the tail of a transient, and measure how much
+ * the signal moves on its own. That second number is what makes an autotune
+ * work on a noisy flow meter: the relay band has to clear the noise, and
+ * guessing it is how you end up switching on noise and measuring your own
+ * sampling. */
+static void autotune_settle(NgsControl *c, uint32_t now_us, float *output_pct)
+{
+    NgsAutotune *at = &c->autotune;
+    float m = c->measurement;
+
+    if (m < at->settle_min) {
+        at->settle_min = m;
+    }
+    if (m > at->settle_max) {
+        at->settle_max = m;
+    }
+
+    c->demand = clampf(at->bias, c->cfg.out_min, c->cfg.out_max);
+    c->output = apply_deadzone(&c->cfg, c->demand);
+    *output_pct = c->output;
+
+    if (!elapsed(now_us, at->started_us + at->settle_us)) {
+        return;
+    }
+
+    at->noise = at->settle_max - at->settle_min;
+
+    if (at->hysteresis <= 0.0f) {
+        /* Sized from what was actually measured rather than from a guess.
+         * 1.5x the observed peak-to-peak wander: below that the relay trips on
+         * noise, and far above it the limit cycle gets sluggish and the
+         * experiment takes all day. */
+        at->hysteresis = 1.5f * at->noise;
+        if (at->hysteresis <= 0.0f) {
+            at->hysteresis = 0.5f; /* a perfectly quiet signal still needs a band */
+        }
+    }
+
+    /* Start the relay from wherever the process actually sits, so the first
+     * crossing is a real one. */
+    at->relay_high = c->measurement < at->setpoint;
+    at->peak_acc = m;
+    at->trough_acc = m;
+    at->last_cross_us = 0;
+    at->state = NGS_AT_RELAY;
+}
+
 static void autotune_tick(NgsControl *c, uint32_t now_us, float *output_pct)
 {
     NgsAutotune *at = &c->autotune;
@@ -453,6 +544,11 @@ static void autotune_tick(NgsControl *c, uint32_t now_us, float *output_pct)
         c->mode = NGS_PUMP_MODE_MANUAL;
         c->output = at->bias;
         *output_pct = c->output;
+        return;
+    }
+
+    if (at->state == NGS_AT_SETTLING) {
+        autotune_settle(c, now_us, output_pct);
         return;
     }
 
@@ -507,9 +603,13 @@ static void autotune_tick(NgsControl *c, uint32_t now_us, float *output_pct)
         }
     }
 
-    /* The relay itself. No slew limiting: the step *is* the experiment. */
-    c->output = clampf(at->relay_high ? at->bias + at->amplitude : at->bias - at->amplitude,
+    /* The relay itself. No slew limiting: the step *is* the experiment.
+     * Stepped in demand space and mapped on the way out, so the two levels are
+     * symmetric about the bias in the space the process responds to -- with a
+     * deadzone, symmetric duties are not symmetric flows. */
+    c->demand = clampf(at->relay_high ? at->bias + at->amplitude : at->bias - at->amplitude,
                        c->cfg.out_min, c->cfg.out_max);
+    c->output = apply_deadzone(&c->cfg, c->demand);
     *output_pct = c->output;
 }
 
@@ -536,6 +636,9 @@ int ngs_control_autotune(NgsControl *c, const NgsAutotuneCmdPayload *cmd, uint32
     if (cmd->hysteresis < 0.0f || isnan(cmd->setpoint) || cmd->setpoint < 0.0f) {
         return NGS_ERR_BAD_ARGUMENT;
     }
+    if (cmd->settle_ms > cmd->timeout_ms) {
+        return NGS_ERR_BAD_ARGUMENT; /* it would never reach the relay phase */
+    }
     if (cmd->cycles < 2u || cmd->cycles > NGS_AT_MAX_CYCLES) {
         return NGS_ERR_BAD_ARGUMENT;
     }
@@ -555,6 +658,11 @@ int ngs_control_autotune(NgsControl *c, const NgsAutotuneCmdPayload *cmd, uint32
     at->hysteresis = cmd->hysteresis;
     at->started_us = now_us;
     at->timeout_us = cmd->timeout_ms * 1000u;
+    /* Default to a couple of seconds: long enough to see the noise, short
+     * enough that nobody times the experiment with a stopwatch. */
+    at->settle_us = (cmd->settle_ms ? cmd->settle_ms : 2000u) * 1000u;
+    at->settle_min = c->measurement;
+    at->settle_max = c->measurement;
     at->relay_high = true;
     at->peak_acc = c->measurement;
     at->trough_acc = c->measurement;
@@ -585,6 +693,8 @@ void ngs_control_get_autotune(const NgsControl *c, NgsAutotuneResultPayload *out
     out->ki = at->ki;
     out->kd = at->kd;
     out->spread = at->spread;
+    out->noise = at->noise;
+    out->hysteresis = at->hysteresis;
 }
 
 /* --------------------------------------------------------------------------
@@ -654,6 +764,8 @@ void ngs_control_get_state(const NgsControl *c, NgsControlStatePayload *out)
     out->mode = c->mode;
     out->flags = c->flags;
     out->autotune_state = c->autotune.state;
+    /* `stored` is the app's business, not the controller's; ngs_app fills it
+     * in after this returns. */
     out->setpoint = c->setpoint_active;
     out->setpoint_target = c->cfg.setpoint;
     out->measurement = c->measurement;

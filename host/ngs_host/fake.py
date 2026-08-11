@@ -69,7 +69,8 @@ class FakeDevice:
         dev.ping()
     """
 
-    def __init__(self, board: FakeBoard | None = None) -> None:
+    def __init__(self, board: FakeBoard | None = None,
+                 nvm: p.ControlCfg | None = None) -> None:
         self.board = board or FakeBoard()
         self._decoder = Decoder()
         self._tx = bytearray()
@@ -93,6 +94,10 @@ class FakeDevice:
         self.last_rx_us = self.board.micros()
 
         self.control = FakeController()
+        # The board's own copy of its tuning, as ngs_store.c holds it.
+        self.nvm: p.ControlCfg | None = nvm
+        if self.nvm is not None:
+            self.control.configure(self.nvm, 0.0)
         self.control_pin = 0
         self.control_bits = 0
 
@@ -236,6 +241,8 @@ class FakeDevice:
             p.MsgType.GET_CONTROL: self._get_control,
             p.MsgType.AUTOTUNE: self._autotune,
             p.MsgType.GET_AUTOTUNE: self._get_autotune,
+            p.MsgType.GET_CONTROL_CFG: self._get_control_cfg,
+            p.MsgType.STORE_CONTROL: self._store_control,
         }.get(frame.type)
 
         if handler is None:
@@ -391,7 +398,10 @@ class FakeDevice:
         return None
 
     def _get_control(self, frame: Frame) -> p.ErrCode | None:
-        self._respond(frame, self.control.state().pack())
+        from dataclasses import replace
+
+        state = replace(self.control.state(), stored=1 if self.nvm is not None else 0)
+        self._respond(frame, state.pack())
         return None
 
     def _autotune(self, frame: Frame) -> p.ErrCode | None:
@@ -403,6 +413,29 @@ class FakeDevice:
         err = self.control.start_autotune(req, self.board.micros(), self.control.output)
         if err:
             return p.ErrCode(err)
+        self._respond(frame)
+        return None
+
+    def _get_control_cfg(self, frame: Frame) -> p.ErrCode | None:
+        self._respond(frame, self.control.cfg.pack())
+        return None
+
+    def _store_control(self, frame: Frame) -> p.ErrCode | None:
+        req = self._unpack(p.StoreCmd, frame)
+        if req is None:
+            return p.ErrCode.BAD_PAYLOAD
+
+        if req.action == p.StoreAction.SAVE:
+            # Mode and setpoint are stripped on the way in, as in ngs_store.c:
+            # a board must never power up already driving a pump.
+            from dataclasses import replace
+
+            self.nvm = replace(self.control.cfg, mode=p.PumpMode.MANUAL, setpoint=0.0)
+        elif req.action == p.StoreAction.ERASE:
+            self.nvm = None
+        else:
+            return p.ErrCode.BAD_ARGUMENT
+
         self._respond(frame)
         return None
 

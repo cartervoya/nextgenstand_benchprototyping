@@ -419,6 +419,8 @@ class FakeController:
             mode=int(self.mode),
             flags=int(self.flags),
             autotune_state=int(self.at.state),
+            stored=0,  # the device layer fills this in
+
             setpoint=self.setpoint_active,
             setpoint_target=self.cfg.setpoint,
             measurement=self.measurement,

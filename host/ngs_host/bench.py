@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 
 from . import protocol as p
 from .device import Device
-from .store import TuningRecord, TuningStore, apply_record
+from .store import TUNED_FIELDS, TuningRecord, TuningStore
 
 
 class EstopLatched(Exception):
@@ -457,20 +457,63 @@ class Bench:
         return self._serial
 
     def load_tuning(self) -> TuningRecord | None:
-        """Apply this board's saved tuning over the configured defaults.
+        """Adopt the board's own tuning.
 
-        Idempotent, and safe to call on every entry point -- which is what it
-        does, because a tuning that only loads down one code path is a tuning
-        you cannot trust to be in effect.
+        The device is the authority: its configuration lives in its NVM, so a
+        fresh checkout, a different laptop, or no host config at all still
+        drives the rig with the gains it was actually set up with. Gains only
+        mean anything against a particular pump, line and flow meter, and the
+        board is the thing bolted to those.
+
+        The calibration is *not* taken from the device. That describes the
+        wiring, it lives in BENCH_CONFIG, and letting a stale stored copy
+        override it would silently rescale every reading.
+
+        Idempotent, and called from every entry point -- a tuning that only
+        loads down one code path is one you cannot trust to be in effect.
         """
-        record = self.store.load(self.board_serial())
-        if record is None:
+        if not self.config.controls:
             return None
 
+        try:
+            on_board = self.device.control_cfg()
+            state = self.device.control()
+        except (p.NgsError, TimeoutError, OSError):
+            return None
+
+        if not state.stored:
+            # Nothing was ever saved, so what the board reports is the
+            # firmware's generic defaults. BENCH_CONFIG's are specific to this
+            # rig and strictly better; adopting the generic ones would quietly
+            # undo, say, the deadband sized to this flow meter's noise.
+            self._loaded_tuning = TuningRecord(values={}, source="firmware defaults")
+            return self._loaded_tuning
+
+        values = {field: getattr(on_board, field) for field in TUNED_FIELDS}
         for name, cfg in self._control_cfg.items():
-            self._control_cfg[name] = apply_record(cfg, record)
-        self._loaded_tuning = record
-        return record
+            self._control_cfg[name] = replace(cfg, **values)
+
+        self._loaded_tuning = TuningRecord(values=values, source="board")
+        return self._loaded_tuning
+
+    def save_to_board(self, output: str = "pump") -> None:
+        """Push the configuration and write it to the board's NVM.
+
+        The board is the authority, so "save" means "save there". The host file
+        is written too, but only as a record.
+        """
+        cfg = self.control_cfg(output)
+        self.device.set_control(replace(cfg, mode=p.PumpMode.MANUAL))
+        self.device.store_control()
+        # Reapply whatever mode was actually in force; the line above deliberately
+        # sent MANUAL so a save can never be what starts a pump.
+        if cfg.mode == p.PumpMode.AUTO:
+            self.device.set_control(cfg)
+
+    def erase_board_tuning(self) -> None:
+        """Forget the board's stored tuning. It falls back to firmware defaults
+        on its next boot."""
+        self.device.erase_control()
 
     def save_tuning(
         self,
@@ -479,12 +522,14 @@ class Bench:
         source: str = "manual",
         result: p.AutotuneResult | None = None,
     ) -> None:
-        """Persist the current tuning for this board.
+        """Write the tuning to the board, and record it in the host file.
 
-        Called automatically whenever the gains change, so a tuning is never
-        lost to closing a terminal -- the failure mode that makes people stop
-        bothering to tune properly.
+        The board copy is what gets read back; the file is a reviewable record
+        so "kp changed on the 12th, from an autotune with Ku 0.52" stays a
+        question git can answer. It is never read back as configuration -- one
+        authority, or you eventually run gains you did not choose.
         """
+        self.save_to_board(output)
         self.store.save(
             self.board_serial(),
             self.control_cfg(output),
@@ -500,7 +545,10 @@ class Bench:
         return self._loaded_tuning
 
     def forget_tuning(self) -> bool:
-        """Discard the saved tuning and go back to the configured defaults."""
+        """Discard the tuning: erased from the board, dropped from the record,
+        and back to the configured defaults here."""
+        with suppress(p.NgsError, TimeoutError, OSError):
+            self.erase_board_tuning()
         dropped = self.store.forget(self.board_serial())
         self._loaded_tuning = None
         for spec in self.config.controls:

@@ -1,9 +1,16 @@
-"""Persisted tuning.
+"""Tuning, with the board as the authority.
 
-An autotune costs a couple of minutes of the pump oscillating on purpose. If
-its result dies with the process, nobody tunes properly. These check it
-survives, that it survives *correctly*, and that every way it can fail ends in
-"carry on with the configured defaults" rather than in a stack trace.
+The device holds its own gains in NVM. Gains only mean anything against a
+particular pump, line and flow meter, and the board is the thing bolted to
+those -- so a fresh checkout, a different laptop, or no host config at all
+still drives the rig the way it was actually set up.
+
+`tuning.json` is still written, but only as a record: reviewable history, never
+read back as configuration. One authority, or you eventually run gains you did
+not choose.
+
+The NVM itself -- CRC, versioning, what a brownout mid-write leaves behind --
+is tested on the board in firmware/test/test_ngs/test_store.h.
 """
 
 from __future__ import annotations
@@ -17,7 +24,7 @@ from ngs_host.bench import BENCH_CONFIG, Bench
 from ngs_host.commands import execute_line
 from ngs_host.device import Device
 from ngs_host.fake import FakeBoard, FakeDevice
-from ngs_host.store import TUNED_FIELDS, TuningStore, apply_record
+from ngs_host.store import TUNED_FIELDS, TuningStore
 
 
 @pytest.fixture
@@ -31,273 +38,211 @@ def store(tmp_path) -> TuningStore:
 
 
 @pytest.fixture
-def bench(board: FakeBoard, store: TuningStore) -> Bench:
-    bench = Bench(Device(FakeDevice(board)), store=store)
+def fake(board: FakeBoard) -> FakeDevice:
+    return FakeDevice(board)
+
+
+@pytest.fixture
+def bench(fake: FakeDevice, store: TuningStore) -> Bench:
+    bench = Bench(Device(fake), store=store)
     bench.initialize()
     return bench
 
 
-def reopen(board: FakeBoard, store: TuningStore) -> Bench:
-    """A fresh host process against the same board and the same file."""
-    bench = Bench(Device(FakeDevice(board)), store=store)
+def power_cycle(fake: FakeDevice, store: TuningStore) -> Bench:
+    """A board that lost power and a host that started fresh.
+
+    Everything in RAM goes; the NVM does not -- which is the whole point of
+    putting the tuning there.
+    """
+    rebooted = FakeDevice(FakeBoard(), nvm=fake.nvm)
+    bench = Bench(Device(rebooted), store=store)
     bench.load_tuning()
     return bench
 
 
-# -- round trip ------------------------------------------------------------
+# -- the board is the authority --------------------------------------------
 
 
-def test_gains_survive_a_new_session(bench, board, store):
-    bench.set_gains(kp=0.31, ki=0.047, kd=0.0)
+def test_gains_survive_a_power_cycle(bench, fake, store):
+    bench.set_gains(kp=0.31, ki=0.047)
 
-    later = reopen(board, store)
+    later = power_cycle(fake, store)
     cfg = later.control_cfg()
     assert cfg.kp == pytest.approx(0.31)
     assert cfg.ki == pytest.approx(0.047)
 
 
-def test_an_autotune_result_survives(bench, board, store):
-    """The expensive case: this is what makes tuning worth doing."""
+def test_the_deadzone_survives_too(bench, fake, store):
     from dataclasses import replace
 
-    bench.set_control_cfg(replace(bench.control_cfg(), kp=0.162, ki=0.0192))
-    later = reopen(board, store)
-    assert later.control_cfg().kp == pytest.approx(0.162)
+    bench.set_control_cfg(replace(bench.control_cfg(), out_deadzone=21.5))
+    assert power_cycle(fake, store).control_cfg().out_deadzone == pytest.approx(21.5)
 
 
-def test_the_filter_and_deadband_persist_too(bench, board, store):
-    execute_line(bench, "KF2.5")
-    execute_line(bench, "KB6")
+def test_a_host_with_no_record_still_gets_the_board_tuning(bench, fake, tmp_path):
+    """The case that motivates board-side storage: a different laptop."""
+    bench.set_gains(kp=0.44)
 
-    cfg = reopen(board, store).control_cfg()
-    assert cfg.filter_tau_s == pytest.approx(2.5)
-    assert cfg.deadband == pytest.approx(6.0)
+    elsewhere = TuningStore(tmp_path / "somewhere-else.json")
+    assert not elsewhere.path.exists()
+
+    later = power_cycle(fake, elsewhere)
+    assert later.control_cfg().kp == pytest.approx(0.44)
 
 
-def test_period_stays_an_integer(bench, board, store):
-    """It is a uint32 on the wire. Casting everything to float fails inside
-    pack(), a long way from the cause."""
+def test_the_host_file_is_not_read_as_configuration(bench, fake, store):
+    """One authority. A file left over from another rig must not quietly
+    become the gains in effect."""
     bench.set_gains(kp=0.2)
-    cfg = reopen(board, store).control_cfg()
 
-    assert isinstance(cfg.period_us, int)
-    cfg.pack()  # would raise struct.error if it were a float
+    store.save(
+        bench.board_serial(),
+        p.ControlCfg(kp=9.9, ki=9.9),
+        source="hand-edited nonsense",
+    )
 
-
-def test_nothing_is_saved_until_something_changes(board, store):
-    Bench(Device(FakeDevice(board)), store=store).load_tuning()
-    assert not store.path.exists()
-
-
-# -- what is deliberately not saved ----------------------------------------
+    later = power_cycle(fake, store)
+    assert later.control_cfg().kp == pytest.approx(0.2)
 
 
-def test_changing_the_setpoint_does_not_rewrite_the_file(bench, store):
-    """Only tuning is persisted, so operating the bench produces no diff --
-    a file that churned every time someone changed a setpoint would be
-    unreviewable and would make `git status` useless during a run."""
+def test_loading_says_where_the_tuning_came_from(bench, fake, store):
+    bench.set_gains(kp=0.2)
+    assert power_cycle(fake, store).loaded_tuning.source == "board"
+
+
+def test_a_board_with_nothing_stored_reports_defaults(board, store):
+    fresh = Bench(Device(FakeDevice(board)), store=store)
+    record = fresh.load_tuning()
+    assert record.source == "firmware defaults"
+
+
+# -- what the board is not asked for ---------------------------------------
+
+
+def test_the_calibration_is_never_taken_from_the_device(bench, fake, store):
+    """It describes the wiring, it lives in BENCH_CONFIG, and a stale stored
+    copy would silently rescale every reading."""
+    fake.nvm = p.ControlCfg(kp=0.3, cal_scale=999.0, cal_offset=999.0)
+
+    later = power_cycle(fake, store)
+    cfg = later.control_cfg()
+    assert cfg.kp == pytest.approx(0.3)
+    assert cfg.cal_scale != pytest.approx(999.0)
+    assert cfg.cal_offset != pytest.approx(999.0)
+    assert "cal_scale" not in TUNED_FIELDS
+
+
+def test_a_saved_board_never_comes_up_running(bench, fake, store):
+    """Mode and setpoint are stripped on the way into NVM: powering up already
+    driving a pump, because that is what it was doing, is not a thing this
+    bench does."""
     bench.set_pump_mode(True, 250.0)
-    bench.set_setpoint(400.0)
-    bench.set_pump_mode(False)
-    assert not store.path.exists()
+    bench.save_to_board()
+
+    assert fake.nvm.mode == p.PumpMode.MANUAL
+    assert fake.nvm.setpoint == 0.0
+
+    later = power_cycle(fake, store)
+    assert later.control_state().mode == p.PumpMode.MANUAL
 
 
-def test_the_setpoint_and_mode_are_not_persisted(bench, board, store):
-    """Restoring those would mean opening a terminal could start the pump.
-    A configuration file has no business doing that."""
-    bench.set_gains(kp=0.2)  # something tuned, so there is a file at all
-    bench.set_pump_mode(True, 250.0)
+def test_saving_does_not_start_the_pump(bench, fake):
+    """The save itself sends MANUAL, so it can never be the thing that starts
+    a pump -- and it must put the mode back afterwards if it was running."""
+    bench.set_pump_mode(True, 200.0)
+    bench.save_to_board()
+    assert bench.control_state().mode == p.PumpMode.AUTO
+
+
+# -- the record ------------------------------------------------------------
+
+
+def test_the_file_still_records_what_was_saved(bench, store):
+    bench.set_gains(kp=0.162, ki=0.0192)
 
     saved = json.loads(store.path.read_text())["boards"][bench.board_serial()]
-    assert "setpoint" not in saved
-    assert "mode" not in saved
-
-    later = reopen(board, store)
-    assert later.control_cfg().mode == p.PumpMode.MANUAL
-    assert later.control_cfg().setpoint == 0.0
+    assert saved["kp"] == pytest.approx(0.162)
+    assert saved["source"] == "manual"
+    assert saved["updated"]
 
 
-def test_the_calibration_is_not_persisted(bench, store):
-    """It belongs to BENCH_CONFIG; a stale copy here would silently override
-    the real wiring."""
-    bench.set_gains(kp=0.2)
-    saved = json.loads(store.path.read_text())["boards"][bench.board_serial()]
-    assert "cal_scale" not in saved
-    assert "cal_offset" not in saved
-
-
-# -- per board -------------------------------------------------------------
-
-
-def test_tuning_is_keyed_by_board(board, store):
-    """Gains belong to a rig. A second Teensy must not inherit the first
-    one's tuning."""
-    first = Bench(Device(FakeDevice(board)), store=store)
-    first.initialize()
-    first.set_gains(kp=0.5)
-
-    other_board = FakeBoard(serial_number=b"\x09\x09\x09\x09\x09\x09\x09\x09")
-    second = Bench(Device(FakeDevice(other_board)), store=store)
-    second.load_tuning()
-
-    assert second.control_cfg().kp == BENCH_CONFIG.controls[0].kp
-    assert first.board_serial() != second.board_serial()
-
-
-# -- provenance ------------------------------------------------------------
-
-
-def test_an_autotune_records_what_it_measured(bench, board, store):
-    """Gains that look wrong later can be traced back to the run."""
-    execute_line(bench, "T240")
-    result = bench.autotune_result()
+def test_an_autotune_records_what_it_measured(bench, store):
     bench.store.save(
         bench.board_serial(), bench.control_cfg(), source="autotune", ku=0.52, tu=3.84, spread=0.01
     )
-
-    record = reopen(board, store).loaded_tuning
-    assert record.source == "autotune"
-    assert record.ku == pytest.approx(0.52)
-    assert "Ku 0.52" in record.describe()
-    assert result is not None
-
-
-def test_a_manual_change_is_marked_as_such(bench, board, store):
-    bench.set_gains(kp=0.2)
-    record = reopen(board, store).loaded_tuning
-    assert record.source == "manual"
-    assert record.updated
-
-
-def test_a_low_confidence_tune_says_so_in_the_description(bench, store):
-    bench.store.save(
-        bench.board_serial(), bench.control_cfg(), source="autotune", ku=9.9, tu=1.0, spread=0.44
-    )
     record = store.load(bench.board_serial())
-    assert "spread" in record.describe()
+    assert record.source == "autotune"
+    assert "Ku 0.52" in record.describe()
+
+
+def test_changing_the_setpoint_writes_nothing(bench, store):
+    """Operating the bench must not churn the record, or `git status` is
+    useless during a run -- and it must not spend flash endurance either."""
+    bench.set_pump_mode(True, 250.0)
+    bench.set_setpoint(400.0)
+    assert not store.path.exists()
+
+
+def test_an_unwritable_record_does_not_take_the_bench_down(bench, tmp_path, fake):
+    """A read-only checkout costs you the history, not the session -- the
+    tuning itself is on the board either way."""
+    blocked = tmp_path / "nope"
+    blocked.write_text("I am a file, not a directory")
+    bench.store = TuningStore(blocked / "tuning.json")
+
+    bench.set_gains(kp=0.25)  # must not raise
+
+    assert bench.control_cfg().kp == pytest.approx(0.25)
+    assert fake.nvm.kp == pytest.approx(0.25)
 
 
 # -- forgetting ------------------------------------------------------------
 
 
-def test_forget_returns_to_the_configured_defaults(bench, board, store):
+def test_forget_erases_the_board_too(bench, fake, store):
     bench.set_gains(kp=0.9)
-    assert bench.forget_tuning()
+    assert fake.nvm is not None
 
-    assert bench.control_cfg().kp == BENCH_CONFIG.controls[0].kp
-    assert reopen(board, store).control_cfg().kp == BENCH_CONFIG.controls[0].kp
-
-
-def test_forgetting_nothing_is_not_an_error(bench):
     bench.forget_tuning()
-    assert bench.forget_tuning() is False
 
-
-# -- failure modes ---------------------------------------------------------
-
-
-def test_a_corrupt_file_falls_back_to_defaults(board, tmp_path):
-    """A bench tool that will not start because its preferences file is
-    corrupt is worse than one that forgets a tuning."""
-    path = tmp_path / "tuning.json"
-    path.write_text("{not json at all")
-
-    bench = Bench(Device(FakeDevice(board)), store=TuningStore(path))
-    assert bench.load_tuning() is None
+    assert fake.nvm is None
     assert bench.control_cfg().kp == BENCH_CONFIG.controls[0].kp
+    assert power_cycle(fake, store).control_cfg().kp == BENCH_CONFIG.controls[0].kp
 
 
-def test_a_file_of_the_wrong_shape_is_ignored(board, tmp_path):
-    path = tmp_path / "tuning.json"
-    path.write_text(json.dumps(["not", "a", "mapping"]))
-
-    bench = Bench(Device(FakeDevice(board)), store=TuningStore(path))
-    assert bench.load_tuning() is None
+# -- entry points ----------------------------------------------------------
 
 
-def test_a_partial_record_leaves_the_rest_at_defaults(board, tmp_path):
-    """An older file that predates a setting must not zero it."""
-    path = tmp_path / "tuning.json"
-    serial = FakeBoard().serial_number.hex()
-    path.write_text(json.dumps({"boards": {serial: {"kp": 0.4}}}))
+def test_every_cli_entry_point_loads_from_the_board(monkeypatch, tmp_path, board):
+    """A tuning that only loads down some code paths is one you cannot trust
+    to be in effect. This caught it being wired into none of them."""
+    from ngs_host import cli
 
-    bench = Bench(Device(FakeDevice(board)), store=TuningStore(path))
-    bench.load_tuning()
+    monkeypatch.setenv("NGS_TUNING_FILE", str(tmp_path / "tuning.json"))
 
-    cfg = bench.control_cfg()
-    assert cfg.kp == pytest.approx(0.4)
-    assert cfg.deadband == BENCH_CONFIG.controls[0].deadband
-    assert cfg.period_us == BENCH_CONFIG.controls[0].period_us
+    seeded = Bench(Device(FakeDevice(board)), store=TuningStore(tmp_path / "t.json"))
+    seeded.initialize()
+    seeded.set_gains(kp=0.42)
+    stored = seeded.device._t.nvm
 
+    monkeypatch.setattr(cli, "make_sim_device", lambda *a, **k: FakeDevice(FakeBoard(), nvm=stored))
+    obj, label = cli._open(port=None, sim=True)
 
-def test_an_unwritable_location_does_not_take_the_bench_down(board, tmp_path):
-    """A read-only checkout costs you persistence, not the session."""
-    blocked = tmp_path / "nope"
-    blocked.write_text("I am a file, not a directory")
-
-    bench = Bench(Device(FakeDevice(board)), store=TuningStore(blocked / "tuning.json"))
-    bench.initialize()
-    bench.set_gains(kp=0.25)  # must not raise
-
-    assert bench.control_cfg().kp == pytest.approx(0.25)
+    assert label == "sim"
+    assert obj.control_cfg().kp == pytest.approx(0.42)
 
 
-def test_the_file_is_written_atomically(bench, store):
-    """Written whole and moved into place: a half-written file reads back as
-    'no tuning' and silently throws away an autotune."""
-    bench.set_gains(kp=0.2)
-    assert store.path.exists()
-    assert not store.path.with_suffix(".json.tmp").exists()
+def test_commands_report_the_gains_the_board_holds(bench, fake, store):
+    bench.set_gains(kp=0.33)
+    later = power_cycle(fake, store)
 
-
-def test_apply_record_only_touches_what_it_carries():
-    from ngs_host.store import TuningRecord
-
-    cfg = p.ControlCfg(kp=0.05, ki=0.02, deadband=2.0)
-    out = apply_record(cfg, TuningRecord(values={"kp": 0.9}))
-
-    assert out.kp == pytest.approx(0.9)
-    assert out.deadband == pytest.approx(2.0)
+    (result,) = execute_line(later, "K?")
+    assert "0.33" in result.text
+    assert "board" in result.text
 
 
 def test_the_saved_field_list_matches_the_config():
-    """Every persisted field has to exist on ControlCfg, or loading one
-    explodes at replace() time."""
     cfg = p.ControlCfg()
     for name in TUNED_FIELDS:
         assert hasattr(cfg, name), name
-
-
-# -- the file itself -------------------------------------------------------
-
-
-def test_the_file_is_readable_and_reviewable(bench, store):
-    """It is meant to be committed, so it has to diff sensibly."""
-    bench.set_gains(kp=0.2)
-    text = store.path.read_text()
-
-    assert text.endswith("\n")
-    data = json.loads(text)
-    assert "_comment" in data
-    # Sorted keys, so a changed gain is a one-line diff rather than a reshuffle.
-    assert text.index('"deadband"') < text.index('"kp"')
-
-
-def test_every_cli_entry_point_loads_the_tuning(monkeypatch, tmp_path, board):
-    """A tuning that only loads down some code paths is one you cannot trust
-    to be in effect. This caught it being wired into none of them.
-    """
-    from ngs_host import cli
-
-    path = tmp_path / "tuning.json"
-    monkeypatch.setenv("NGS_TUNING_FILE", str(path))
-
-    seeded = Bench(Device(FakeDevice(board)), store=TuningStore(path))
-    seeded.initialize()
-    seeded.set_gains(kp=0.42)
-
-    # The simulated path, which is what `--sim` uses.
-    obj, label = cli._open(port=None, sim=True)
-    assert label == "sim"
-    assert obj.control_cfg().kp == pytest.approx(0.42)
-    assert obj.loaded_tuning is not None

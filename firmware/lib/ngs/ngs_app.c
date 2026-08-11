@@ -10,6 +10,7 @@
 
 #include "ngs_board.h"
 #include "ngs_protocol.h"
+#include "ngs_store.h"
 
 /* Cap on bytes pulled from the receive buffer per poll. Without it, a host
  * that streams commands faster than we serve them would starve telemetry and
@@ -334,6 +335,7 @@ static int handle_get_control(NgsApp *app, const NgsFrame *req)
 {
     NgsControlStatePayload st;
     ngs_control_get_state(&app->control, &st);
+    st.stored = app->control_stored ? 1u : 0u;
     app_send(app, (uint8_t)(req->type | NGS_MSG_RESP), req->seq, &st, sizeof(st));
     return 0;
 }
@@ -353,6 +355,41 @@ static int handle_autotune(NgsApp *app, const NgsFrame *req)
     int err = ngs_control_autotune(&app->control, &p, ngs_board_micros(), app->control.output);
     if (err != 0) {
         return err;
+    }
+    app_send_ack(app, req);
+    return 0;
+}
+
+static int handle_get_control_cfg(NgsApp *app, const NgsFrame *req)
+{
+    /* The device is the authority on its own tuning, so the host asks rather
+     * than assumes. */
+    app_send(app, (uint8_t)(req->type | NGS_MSG_RESP), req->seq, &app->control.cfg,
+             sizeof(app->control.cfg));
+    return 0;
+}
+
+static int handle_store_control(NgsApp *app, const NgsFrame *req)
+{
+    if (req->len != sizeof(NgsStoreCmdPayload)) {
+        return NGS_ERR_BAD_PAYLOAD;
+    }
+    NgsStoreCmdPayload p;
+    memcpy(&p, req->payload, sizeof(p));
+
+    bool ok;
+    if (p.action == NGS_STORE_ACTION_SAVE) {
+        ok = ngs_store_save(&app->control.cfg);
+        app->control_stored = ok;
+    } else if (p.action == NGS_STORE_ACTION_ERASE) {
+        ok = ngs_store_erase();
+        app->control_stored = false;
+    } else {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
+
+    if (!ok) {
+        return NGS_ERR_NOT_SUPPORTED; /* the NVM refused the write */
     }
     app_send_ack(app, req);
     return 0;
@@ -429,6 +466,8 @@ static void app_dispatch(NgsApp *app, const NgsFrame *req)
     case NGS_MSG_GET_CONTROL: err = handle_get_control(app, req); break;
     case NGS_MSG_AUTOTUNE:    err = handle_autotune(app, req); break;
     case NGS_MSG_GET_AUTOTUNE: err = handle_get_autotune(app, req); break;
+    case NGS_MSG_GET_CONTROL_CFG: err = handle_get_control_cfg(app, req); break;
+    case NGS_MSG_STORE_CONTROL: err = handle_store_control(app, req); break;
     default:                 err = NGS_ERR_UNKNOWN_TYPE; break;
     }
 
@@ -481,6 +520,17 @@ void ngs_app_init(NgsApp *app)
     memset(app, 0, sizeof(*app));
     ngs_decoder_init(&app->decoder);
     ngs_control_init(&app->control);
+
+    /* The stored tuning is the board's, so it applies before any host has said
+     * anything. Mode is forced to MANUAL on the way into NVM, so this can never
+     * bring a pump up running. */
+    NgsControlCfgPayload stored;
+    if (ngs_store_load(&stored)) {
+        if (ngs_control_configure(&app->control, &stored, 0.0f) == 0) {
+            app->control_stored = true;
+        }
+    }
+
     app->last_poll_us = ngs_board_micros();
     app->last_rx_us = app->last_poll_us;
 }

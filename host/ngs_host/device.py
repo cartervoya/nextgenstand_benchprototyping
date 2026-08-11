@@ -395,6 +395,24 @@ class Device:
         """
         self._transact(p.MsgType.SET_CONTROL, cfg.pack())
 
+    def control_cfg(self) -> p.ControlCfg:
+        """What the board is configured with. The device is the authority on
+        its own tuning, so the host asks rather than assuming."""
+        return p.ControlCfg.unpack(self._transact(p.MsgType.GET_CONTROL_CFG))
+
+    def store_control(self) -> None:
+        """Write the current configuration to the board's NVM.
+
+        Explicit rather than automatic on every change: the store is emulated
+        in flash and has a finite erase budget.
+        """
+        self._transact(p.MsgType.STORE_CONTROL, p.StoreCmd(p.StoreAction.SAVE).pack())
+
+    def erase_control(self) -> None:
+        """Forget the stored configuration; the board falls back to firmware
+        defaults on its next boot."""
+        self._transact(p.MsgType.STORE_CONTROL, p.StoreCmd(p.StoreAction.ERASE).pack())
+
     def control(self) -> p.ControlState:
         """What the loop is doing right now, including the split P/I/D terms."""
         return p.ControlState.unpack(self._transact(p.MsgType.GET_CONTROL))
