@@ -257,7 +257,7 @@ PAGE = """<!doctype html>
   <div class="content">
   <h1>NextGen Stand bench</h1>
   <button type="button" class="estop" id="estopbtn"
-          title="Everything to its safe state, latched (or press Escape)">EMERGENCY STOP</button>
+          title="Everything to its safe state, latched (Ctrl-E)">EMERGENCY STOP</button>
   <div class="bar ok" id="bar">connecting...</div>
   <table id="channels"></table>
   <div id="loop" class="loop"></div>
@@ -393,10 +393,13 @@ $("form").addEventListener("submit", (e) => {
 $("stopbtn").addEventListener("click", () => send("X"));
 $("estopbtn").addEventListener("click", () => send(
   $("estopbtn").classList.contains("latched") ? "EC" : "!"));
-// Escape is the E-stop here: no line to finish, works from anywhere on
-// the page including while typing a command.
+// Ctrl-E, matching the terminal dashboard. NOT Escape: people press Escape to
+// dismiss and clear things, and it clears the input line in the terminal UI --
+// binding a latching emergency stop to it made it a hair trigger, which is
+// exactly how this ended up latched by accident.
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { e.preventDefault(); send("!"); }
+  if (e.key === "e" && e.ctrlKey) { e.preventDefault(); send("!"); }
+  if (e.key === "Escape") { $("line").value = ""; }
 });
 $("line").addEventListener("keydown", (e) => {   // arrow-key history
   if (e.key === "ArrowUp" && hpos > 0) { $("line").value = history[--hpos]; e.preventDefault(); }

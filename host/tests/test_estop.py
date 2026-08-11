@@ -299,3 +299,62 @@ def test_estop_registers_the_table_if_the_device_has_none(fake, board):
 
     assert fake.safe_entries, "no safe state registered before latching"
     assert board.pin_values[32] == 0
+
+
+# -- starting up against a latched board -----------------------------------
+
+
+def test_initialize_refuses_clearly_when_latched(bench):
+    """It used to fail at whichever output happened to be configured first,
+    as a raw ESTOP traceback that said nothing about what to do."""
+    from ngs_host.bench import EstopLatched
+
+    bench.estop()
+    with pytest.raises(EstopLatched) as exc:
+        bench.initialize()
+
+    assert "latched" in str(exc.value)
+    assert "estop --clear" in str(exc.value) or "EC" in str(exc.value)
+    assert "command" in str(exc.value)  # says which source
+
+
+def test_initialize_does_not_clear_the_latch_by_itself(bench):
+    """An emergency stop any startup can undo is not an emergency stop."""
+    from ngs_host.bench import EstopLatched
+
+    bench.estop()
+    with pytest.raises(EstopLatched):
+        bench.initialize()
+    assert bench.device.status().estopped
+
+
+def test_initialize_can_clear_when_explicitly_asked(bench, board):
+    bench.set_valve("valve1", True)
+    bench.estop()
+
+    bench.initialize(clear_estop=True)
+
+    assert not bench.device.status().estopped
+    assert board.pin_values[32] == 0
+
+
+def test_a_watchdog_latch_reports_its_source(bench, fake):
+    from ngs_host.bench import EstopLatched
+
+    fake.engage_estop(p.EstopSource.WATCHDOG)
+    with pytest.raises(EstopLatched, match="watchdog"):
+        bench.initialize()
+
+
+def test_arming_the_watchdog_can_be_undone(bench, fake):
+    """A dashboard that armed it must be able to disarm it on the way out,
+    or a clean quit latches the board seconds later."""
+    bench.initialize(watchdog_ms=3000)
+    assert fake.watchdog_ms == 3000
+
+    bench.register_safe_state(watchdog_ms=0)
+    assert fake.watchdog_ms == 0
+
+    fake.last_rx_us -= 60_000_000
+    fake._poll_watchdog()
+    assert not fake.estop

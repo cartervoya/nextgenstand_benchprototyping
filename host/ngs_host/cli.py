@@ -18,7 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .bench import BENCH_CONFIG, Bench
+from .bench import BENCH_CONFIG, Bench, EstopLatched
 from .commands import execute_line
 from .device import Device, find_ports
 from .keyboard import stdin_is_interactive
@@ -72,6 +72,17 @@ def _open(port: str | None, sim: bool, timeout: float = 1.0) -> tuple[Bench, str
     # The resolved port, not "auto": which board you are actually talking to is
     # the whole point of the label once a second one shows up on the bench.
     return _with_tuning(Bench(device)), device.port or "?"
+
+
+def _bring_up(bench: Bench, watchdog: int, clear_estop: bool) -> None:
+    """Initialise, turning a latched board into an instruction rather than a
+    traceback."""
+    try:
+        bench.initialize(watchdog_ms=watchdog, clear_estop=clear_estop)
+    except EstopLatched as exc:
+        console.print(f"[bold white on red] EMERGENCY STOP [/bold white on red] {exc}")
+        console.print("[dim]Or start with --clear-estop to release it and carry on.[/dim]")
+        raise typer.Exit(3) from None
 
 
 def _run(bench: Bench, line: str) -> None:
@@ -187,6 +198,9 @@ def bench(
             help="Latch the E-stop if the host goes quiet for this many ms. 0 disables.",
         ),
     ] = 0,
+    clear_estop: Annotated[
+        bool, typer.Option("--clear-estop", help="Release a latched emergency stop on start.")
+    ] = False,
 ) -> None:
     """Live dashboard: polls at 2 Hz and takes commands (V1O; P50; ...)."""
     # Checked before opening the port: if we cannot run, there is no reason to
@@ -202,13 +216,18 @@ def bench(
     obj, label = _open(port, sim, timeout)
     with obj.device:
         if not no_init:
-            obj.initialize(watchdog_ms=watchdog)
+            _bring_up(obj, watchdog, clear_estop)
         try:
             Dashboard(obj, port=label, console=console).run()
         finally:
-            # Whatever happened -- crash, quit, Ctrl-C -- the pump does not
-            # get left running.
+            # Whatever happened -- crash, quit, Ctrl-C -- the pump does not get
+            # left running, and the watchdog this dashboard armed does not
+            # outlive it. Leaving it armed means a clean quit latches the board
+            # a few seconds later, and the next session opens onto an emergency
+            # stop nobody pressed.
             obj.stop()
+            if watchdog:
+                obj.register_safe_state(watchdog_ms=0)
 
 
 @app.command()
@@ -380,6 +399,9 @@ def web(
             help="Latch the E-stop if the host goes quiet for this many ms. 0 disables.",
         ),
     ] = 0,
+    clear_estop: Annotated[
+        bool, typer.Option("--clear-estop", help="Release a latched emergency stop on start.")
+    ] = False,
 ) -> None:
     """Serve the dashboard as a local web page, for a separate window.
 
@@ -394,7 +416,7 @@ def web(
     url = f"http://127.0.0.1:{http_port}/"
 
     with obj.device:
-        obj.initialize(watchdog_ms=watchdog)
+        _bring_up(obj, watchdog, clear_estop)
         state = WebBench(obj, label)
         try:
             state.fw = obj.device.info().fw_version
@@ -419,8 +441,11 @@ def web(
             console.print("\nstopping")
         finally:
             server.server_close()
-            # Never leave the pump running because a browser tab was closed.
+            # Never leave the pump running because a browser tab was closed,
+            # and never leave a watchdog armed with nobody left to feed it.
             obj.stop()
+            if watchdog:
+                obj.register_safe_state(watchdog_ms=0)
 
 
 @app.command()

@@ -25,6 +25,14 @@ from . import protocol as p
 from .device import Device
 from .store import TuningRecord, TuningStore, apply_record
 
+
+class EstopLatched(Exception):
+    """The bench cannot be brought up because the emergency stop is engaged.
+
+    Its own type so a UI can say what to do about it instead of showing a
+    traceback from whichever output it happened to try to drive first.
+    """
+
 # --------------------------------------------------------------------------
 # Board facts
 # --------------------------------------------------------------------------
@@ -687,13 +695,27 @@ class Bench:
 
     # -- setup -------------------------------------------------------------
 
-    def initialize(self, watchdog_ms: int | None = None) -> None:
+    def initialize(self, watchdog_ms: int | None = None, *, clear_estop: bool = False) -> None:
         """Put the bench in a known safe state: valves closed, PWM at its
         default, PWM frequency and resolution configured.
 
         Safe to call on an already-running bench -- it is also how you recover
         after the board resets underneath you.
         """
+        # A latched board refuses every write below. Say so in one line rather
+        # than failing at whichever output happens to be configured first --
+        # and do not clear it silently: an emergency stop that any startup can
+        # undo is not one.
+        status = self.device.status()
+        if status.estopped:
+            if not clear_estop:
+                raise EstopLatched(
+                    f"the emergency stop is latched ({status.estop_source_name.lower()}). "
+                    "Nothing can be driven until it is cleared: run `ngs estop --clear`, "
+                    "or send EC."
+                )
+            self.clear_estop()
+
         # Saved tuning first: everything below configures the device, and it
         # should be configured with the gains this rig was actually tuned to.
         self.load_tuning()
