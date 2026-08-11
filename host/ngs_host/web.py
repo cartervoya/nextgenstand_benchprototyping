@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 from .bench import Bench, Snapshot
-from .commands import execute_line, help_text
+from .commands import execute_line, help_rows
 
 DEFAULT_PORT = 8765
 HOST = "127.0.0.1"
@@ -159,7 +159,8 @@ def make_handler(web: WebBench) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's API
             if self.path in ("/", "/index.html"):
-                page = PAGE.replace("__HELP__", json.dumps(help_text(web.bench)))
+                rows = [[r.syntax, r.description] for r in help_rows(web.bench)]
+                page = PAGE.replace("__HELP__", json.dumps(rows))
                 self._send(200, page.encode(), "text/html; charset=utf-8")
             elif self.path == "/api/state":
                 self._send_json(web.state())
@@ -198,7 +199,26 @@ PAGE = """<!doctype html>
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:14px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace; }
-  main { max-width:900px; margin:0 auto; padding:16px; }
+  main { max-width:1180px; margin:0 auto; padding:16px;
+         display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px;
+         align-items:start; }
+  .content { min-width:0; }
+  /* The dock stays put while the log scrolls -- the whole point. */
+  aside { position:sticky; top:16px; background:var(--panel); border:1px solid var(--line);
+          border-radius:6px; padding:10px 12px; }
+  aside h2 { font-size:11px; text-transform:uppercase; letter-spacing:1px;
+             color:var(--dim); margin:0 0 8px; font-weight:700; }
+  /* Deliberately smaller than the readouts: this is reference, not data. */
+  aside table { font-size:11.5px; line-height:1.45; }
+  aside td { padding:1px 0; border:0; vertical-align:top; }
+  aside td.k { color:var(--accent); font-weight:700; white-space:nowrap; padding-right:10px; }
+  aside td.v { color:var(--dim); }
+  aside .foot { margin-top:8px; padding-top:8px; border-top:1px solid var(--line);
+                font-size:11px; color:var(--dim); }
+  @media (max-width:900px) {
+    main { grid-template-columns:minmax(0,1fr); }
+    aside { position:static; }
+  }
   h1 { font-size:15px; margin:0 0 12px; color:var(--dim); font-weight:600; }
   .bar { padding:8px 12px; border:1px solid var(--line); border-radius:6px;
          background:var(--panel); margin-bottom:12px; }
@@ -234,6 +254,7 @@ PAGE = """<!doctype html>
 </style>
 </head>
 <body><main>
+  <div class="content">
   <h1>NextGen Stand bench</h1>
   <button type="button" class="estop" id="estopbtn"
           title="Everything to its safe state, latched (or press Escape)">EMERGENCY STOP</button>
@@ -246,6 +267,13 @@ PAGE = """<!doctype html>
     <button type="submit">Send</button>
     <button type="button" class="stop" id="stopbtn" title="Pump to 0, valves closed">STOP</button>
   </form>
+  </div>
+  <aside>
+    <h2>commands</h2>
+    <table id="help"></table>
+    <div class="foot">chain with <b>;</b> &mdash; e.g. <b>V1O;P50;</b><br>
+      <b>Escape</b> = emergency stop</div>
+  </aside>
 </main>
 <script>
 const HELP = __HELP__;
@@ -337,7 +365,7 @@ async function poll() {
 
 async function send(line) {
   if (!line.trim() || busy) return;
-  if (line.trim() === "?") { log(HELP); return; }
+  if (line.trim() === "?") { log("commands are listed in the panel on the right"); return; }
   busy = true;
   log("> " + line, "echo");
   history.push(line); hpos = history.length;
@@ -379,7 +407,9 @@ $("line").addEventListener("keydown", (e) => {   // arrow-key history
   }
 });
 
-log(HELP);
+$("help").innerHTML = HELP.map(([k, v]) =>
+  "<tr><td class='k'>" + k + "</td><td class='v'>" + v + "</td></tr>").join("");
+log("ready -- commands are listed on the right");
 poll();
 setInterval(poll, 500);    // 2 Hz, matching the terminal dashboard
 </script>

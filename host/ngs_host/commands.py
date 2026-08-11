@@ -64,6 +64,9 @@ class CommandResult:
     should_quit: bool = False
     #: Set by `status`, which the UI renders itself rather than as a line.
     show_status: bool = False
+    #: Set by `help`. A UI with the reference permanently on screen can
+    #: acknowledge it in one line instead of reprinting the whole thing.
+    show_help: bool = False
 
 
 class CommandError(Exception):
@@ -455,7 +458,7 @@ def _cmd_quit(bench: Bench) -> CommandResult:
 
 
 def _cmd_help(bench: Bench) -> CommandResult:
-    return CommandResult(True, help_text(bench))
+    return CommandResult(True, help_text(bench), show_help=True)
 
 
 _GLOBALS: dict[str, Callable[[Bench], CommandResult]] = {
@@ -471,29 +474,46 @@ _GLOBALS: dict[str, Callable[[Bench], CommandResult]] = {
 }
 
 
-def help_text(bench: Bench) -> str:
-    """Help built from the live config, so it cannot drift from the hardware.
+@dataclass(frozen=True, slots=True)
+class HelpRow:
+    """One line of the command reference.
 
-    Two columns, aligned to the widest syntax rather than to hand-counted
-    spaces -- a longer code in a future config would otherwise ragged the
-    whole block.
+    Two descriptions, because the reference is rendered in two very different
+    places: a scrolling log where there is room to explain, and an
+    always-visible panel where there is not. Writing the short one by hand
+    beats truncating the long one, which cuts exactly the part that mattered.
     """
-    rows: list[tuple[str, str]] = []
+
+    syntax: str
+    description: str
+    short: str
+
+
+def help_rows(bench: Bench) -> list[HelpRow]:
+    """The command reference, built from the live config so it cannot drift
+    from the hardware."""
+    rows: list[HelpRow] = []
 
     for valve in bench.config.valves:
-        rows.append((
-            f"{valve.code}O / {valve.code}C / {valve.code}T / {valve.code}?",
-            f"open / close / toggle / query {valve.description} (pin {valve.pin})",
-        ))
+        rows.append(
+            HelpRow(
+                f"{valve.code}O / {valve.code}C / {valve.code}T / {valve.code}?",
+                f"open / close / toggle / query {valve.description} (pin {valve.pin})",
+                f"{valve.description} (pin {valve.pin})",
+            )
+        )
     if len(bench.config.valves) > 1:
-        rows.append(("VO / VC", "open / close every valve at once"))
+        rows.append(HelpRow("VO / VC", "open / close every valve at once", "all valves"))
 
     for pwm in bench.config.pwms:
-        rows.append((
-            f"{pwm.code}<0-100> / {pwm.code}+<n> / {pwm.code}?",
-            f"set / adjust / query {pwm.description} "
-            f"(pin {pwm.pin}, {pwm.freq_hz / 1000:g} kHz)",
-        ))
+        rows.append(
+            HelpRow(
+                f"{pwm.code}<0-100> / {pwm.code}+<n> / {pwm.code}?",
+                f"set / adjust / query {pwm.description} "
+                f"(pin {pwm.pin}, {pwm.freq_hz / 1000:g} kHz)",
+                f"{pwm.description} %, manual",
+            )
+        )
         if any(c.output == pwm.name for c in bench.config.controls):
             unit = next(
                 (
@@ -505,35 +525,67 @@ def help_text(bench: Bench) -> str:
                 ),
                 "units",
             )
-            rows.append((
-                f"{pwm.code}A<setpoint> / {pwm.code}M",
-                f"closed-loop on the flow setpoint ({unit}) / back to manual",
-            ))
+            rows.append(
+                HelpRow(
+                    f"{pwm.code}A<setpoint> / {pwm.code}M",
+                    f"closed-loop on the flow setpoint ({unit}) / back to manual",
+                    f"closed loop ({unit}) / manual",
+                )
+            )
     for analog in bench.config.analogs:
-        rows.append((
-            f"{analog.code}?",
-            f"read {analog.description} (pin {analog.pin}, {analog.unit})",
-        ))
+        rows.append(
+            HelpRow(
+                f"{analog.code}?",
+                f"read {analog.description} (pin {analog.pin}, {analog.unit})",
+                f"read {analog.description}",
+            )
+        )
 
     if bench.config.controls:
         rows += [
-            ("K? / KP<n> / KI<n> / KD<n>", "show or set the loop gains"),
-            ("KF<seconds> / KB<units>", "measurement filter / integration deadband"),
-            ("T<setpoint>", "autotune around a setpoint (the pump will oscillate)"),
-            ("T? / TA / TX", "autotune progress / adopt the gains / abort"),
+            HelpRow("K? / KP<n> / KI<n> / KD<n>", "show or set the loop gains", "loop gains"),
+            HelpRow(
+                "KF<seconds> / KB<units>",
+                "measurement filter / integration deadband",
+                "filter / deadband",
+            ),
+            HelpRow(
+                "T<setpoint>",
+                "autotune around a setpoint (the pump will oscillate)",
+                "autotune (pump oscillates)",
+            ),
+            HelpRow(
+                "T? / TA / TX",
+                "autotune progress / adopt the gains / abort",
+                "tune: see/adopt/stop",
+            ),
         ]
 
     rows += [
-        ("! or E", "EMERGENCY STOP -- everything safe, latched (Ctrl-E too)"),
-        ("EC", "clear the emergency stop"),
-        ("S", "device status"),
-        ("X", "stop: pump to default, valves closed"),
-        ("Z", "re-initialise the bench"),
-        ("Q", "quit"),
+        HelpRow(
+            "! or E",
+            "EMERGENCY STOP -- everything safe, latched (Ctrl-E too)",
+            "EMERGENCY STOP (Ctrl-E)",
+        ),
+        HelpRow("EC", "clear the emergency stop", "clear the E-stop"),
+        HelpRow("S", "device status", "device status"),
+        HelpRow("X", "stop: pump to default, valves closed", "soft stop"),
+        HelpRow("Z", "re-initialise the bench", "re-initialise"),
+        HelpRow("Q", "quit", "quit"),
     ]
 
-    width = max(len(syntax) for syntax, _ in rows)
+    return rows
+
+
+def help_text(bench: Bench) -> str:
+    """The reference as flowing text, for anywhere without a panel to put it.
+
+    Aligned to the widest syntax rather than to hand-counted spaces -- a longer
+    code in a future config would otherwise ragged the whole block.
+    """
+    rows = help_rows(bench)
+    width = max(len(row.syntax) for row in rows)
     return "\n".join(
         ["commands (chain with ';', e.g. V1O;P50;)"]
-        + [f"  {syntax.ljust(width)}   {description}" for syntax, description in rows]
+        + [f"  {row.syntax.ljust(width)}   {row.description}" for row in rows]
     )

@@ -16,7 +16,15 @@ from ngs_host.bench import Bench
 from ngs_host.device import Device
 from ngs_host.fake import FakeBoard, FakeDevice
 from ngs_host.keyboard import BACKSPACE, CTRL_C, ENTER, LineEditor
-from ngs_host.ui import POLL_INTERVAL, Dashboard, render
+from ngs_host.ui import (
+    MIN_LOG_LINES,
+    POLL_INTERVAL,
+    Dashboard,
+    LogLine,
+    log_capacity,
+    render,
+    render_commands,
+)
 
 
 @pytest.fixture
@@ -33,7 +41,7 @@ def dash(board: FakeBoard) -> Dashboard:
     return dash
 
 
-def to_text(dash: Dashboard) -> str:
+def to_text(dash: Dashboard, height: int = 40) -> str:
     console = Console(file=io.StringIO(), width=100)
     console.print(
         render(
@@ -43,6 +51,8 @@ def to_text(dash: Dashboard) -> str:
             port="sim",
             fw="0.1.0",
             poll_hz=2.0,
+            bench=dash.bench,
+            height=height,
         )
     )
     return console.file.getvalue()
@@ -164,3 +174,81 @@ def test_history_is_kept():
     editor = LineEditor()
     editor.feed(f"V1O{ENTER}")
     assert editor.history == ["V1O"]
+
+
+# -- the command reference panel -------------------------------------------
+
+
+def test_every_command_is_on_screen_at_once(dash):
+    """The whole point: the reference used to be dumped into the log, where
+    sixteen lines pushed everything else out and then scrolled away."""
+    from ngs_host.commands import help_rows
+
+    text = to_text(dash)
+    for row in help_rows(dash.bench):
+        assert row.syntax in text, f"{row.syntax} missing from the panel"
+
+
+def test_the_panel_is_not_in_the_log(dash):
+    """Startup must not print the reference into the log any more."""
+    assert not any("V1O / V1C" in line.text for line in dash.log)
+
+
+def test_asking_for_help_does_not_reprint_the_list(dash):
+    dash.handle("?")
+    assert any("panel" in line.text for line in dash.log)
+    assert not any("KF<seconds>" in line.text for line in dash.log)
+
+
+def test_syntax_is_never_truncated(dash):
+    """A clipped description costs a hint; a clipped command costs the
+    command."""
+    from ngs_host.commands import help_rows
+
+    console = Console(file=io.StringIO(), width=100)
+    console.print(render_commands(dash.bench))
+    text = console.file.getvalue()
+
+    for row in help_rows(dash.bench):
+        assert row.syntax in text
+    # The ellipsis Rich inserts when it clips.
+    assert "…" not in text.split("\n")[0]
+
+
+@pytest.mark.parametrize(("width", "height"), [(120, 40), (100, 34), (100, 30), (100, 24)])
+def test_the_dashboard_fits_the_terminal(dash, width, height):
+    """Nothing may need scrolling to be read -- including on a small window,
+    where the log gives way rather than the reference."""
+    console = Console(file=io.StringIO(), width=width, height=height)
+    console.print(
+        render(
+            dash.snapshot,
+            [LogLine(f"line {i}") for i in range(20)],
+            "PA250",
+            port="COM3",
+            fw="0.1.0",
+            poll_hz=2.0,
+            bench=dash.bench,
+            height=height,
+        )
+    )
+    rendered = len(console.file.getvalue().rstrip().splitlines())
+    assert rendered <= height, f"{rendered} lines rendered into {height} rows"
+
+
+def test_a_short_terminal_drops_descriptions_before_commands(dash):
+    """Compact mode keeps every command and sheds the gloss."""
+    from ngs_host.commands import help_rows
+
+    console = Console(file=io.StringIO(), width=100)
+    console.print(render_commands(dash.bench, compact=True))
+    text = console.file.getvalue()
+
+    for row in help_rows(dash.bench):
+        assert row.syntax in text
+    assert "device status" not in text  # the description is what went
+
+
+def test_the_log_shrinks_rather_than_the_reference():
+    assert log_capacity(40, 10) > log_capacity(26, 10)
+    assert log_capacity(20, 10) >= MIN_LOG_LINES

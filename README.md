@@ -148,16 +148,37 @@ when the hardware is busy.
 
 ```
 +- NextGen Stand bench ------------------------------------------------------+
-| COM7  fw 0.1.0  2.0 Hz  up 41.2s  rx 184  tx 184  crc-err 0  43.1 C        |
+| COM3  fw 0.1.0  2.0 Hz  up 41.2s  rx 184  tx 184  crc-err 0  43.1 C        |
 |                                                                            |
-| P    Pump speed      50.0 %    pin 33, 50 kHz, 12-bit                      |
-| V1   Valve 1         OPEN      pin 32                                      |
-| V2   Valve 2         CLOSED    pin 31                                      |
+| P    Pump speed      50.0 %         pin 33, 50 kHz, 12-bit                 |
+| V1   Valve 1         OPEN           pin 32                                 |
+| V2   Valve 2         CLOSED         pin 31                                 |
 | F    Flow meter      298.4 mL/min   pin 27, 1.794 V, raw 2226              |
 |                                                                            |
+| +- commands ------------------------------------------------------------+  |
+| | V1O / V1C / V1T / V1?  Valve 1 (pin 32)   T<setpoint>  autotune       |  |
+| | V2O / V2C / V2T / V2?  Valve 2 (pin 31)   T? / TA / TX tune: see/adopt|  |
+| | VO / VC                all valves         ! or E       EMERGENCY STOP |  |
+| | P<0-100> / P+<n> / P?  Pump speed %       EC           clear E-stop   |  |
+| | PA<setpoint> / PM      closed loop        S            device status  |  |
+| | F?                     read flow          X            soft stop      |  |
+| | K? / KP<n> / KI<n>     loop gains         Z            re-initialise  |  |
+| | KF<seconds> / KB<n>    filter / deadband  Q            quit           |  |
+| +------------------------------------------------------------------------+ |
+|                                                                            |
+| V1 Valve 1: OPEN                                                           |
 | > P60_                                                                     |
-+---------------------------------- ? for help, Q to quit -------------------+
++------- Ctrl-E: EMERGENCY STOP  .  chain with ';'  .  Q to quit ------------+
 ```
+
+The command reference is a permanent panel, not something printed into the log
+-- the log is a stream and the reference is not, so mixing them meant the list
+scrolled away the moment anything happened. It shrinks to a syntax-only,
+three-wide layout on a short terminal, and the log gives up its lines before
+the reference gives up any of its. Below about 24 rows the window is genuinely
+too small; enlarge it.
+
+`ngs web` puts the same list in a sticky side dock at a smaller size.
 
 The header is measured, not assumed — if the link slows down, the displayed
 rate drops rather than claiming 2 Hz over stale numbers.

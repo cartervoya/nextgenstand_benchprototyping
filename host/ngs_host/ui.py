@@ -24,7 +24,7 @@ from rich.text import Text
 
 from . import protocol as p
 from .bench import Bench, Snapshot, ValveReading
-from .commands import CommandResult, execute_line, help_text
+from .commands import CommandResult, execute_line, help_rows
 from .keyboard import (
     EmergencyStop,
     LineEditor,
@@ -40,7 +40,12 @@ POLL_INTERVAL = 0.5
 #: UI tick. Fast enough that keystrokes echo instantly, slow enough to idle.
 TICK = 0.04
 
-LOG_LINES = 8
+#: Fewest log lines worth keeping. Everything else gives way to the command
+#: reference first, because the reference is what must never be cut off.
+MIN_LOG_LINES = 1
+
+#: Log lines when there is room for them.
+MAX_LOG_LINES = 8
 
 
 @dataclass
@@ -96,6 +101,61 @@ def render_channels(snapshot: Snapshot) -> Table:
         )
 
     return table
+
+
+#: Below this many terminal rows the reference drops its descriptions and goes
+#: three-wide, because fitting entirely on screen matters more than the gloss.
+COMPACT_BELOW = 32
+
+
+def render_commands(bench: Bench, *, compact: bool = False) -> Table:
+    """The command reference, laid out to be read at a glance.
+
+    Columns rather than one long list: the full list is sixteen lines on this
+    bench, which was more than the log had to spare -- which is exactly why it
+    used to scroll away. Two-wide it is eight lines.
+
+    Nothing wraps. A description that spills onto a second line makes the block
+    ragged and costs more height than the words are worth, so they are clipped
+    instead; the syntax, which is the part you actually need, never is.
+    """
+    rows = help_rows(bench)
+    columns = 3 if compact else 2
+    per_column = -(-len(rows) // columns)  # ceiling division
+
+    # The syntax column is sized to the longest entry so it is never clipped:
+    # a truncated description costs you a hint, a truncated command costs you
+    # the command. Descriptions take whatever is left.
+    syntax_width = max(len(row.syntax) for row in rows) + 2
+
+    table = Table(box=None, pad_edge=False, expand=True, show_header=False)
+    for _ in range(columns):
+        table.add_column(style="bold", no_wrap=True, min_width=syntax_width)
+        if not compact:
+            table.add_column(style="dim", no_wrap=True, overflow="ellipsis")
+
+    for i in range(per_column):
+        cells: list[str] = []
+        for column in range(columns):
+            index = i + column * per_column
+            row = rows[index] if index < len(rows) else None
+            cells.append(row.syntax if row else "")
+            if not compact:
+                cells.append(row.short if row else "")
+        table.add_row(*cells)
+
+    return table
+
+
+def log_capacity(height: int, command_lines: int) -> int:
+    """How many log lines fit once everything fixed has had its share.
+
+    The reference is not allowed to be the thing that gets cut: it is static,
+    so scrolling it away is pure loss, whereas the log is a stream and losing
+    its oldest line costs nothing.
+    """
+    fixed = command_lines + 15  # header, channels, loop, prompt, borders, gaps
+    return max(MIN_LOG_LINES, min(MAX_LOG_LINES, height - fixed))
 
 
 def render_loop(snapshot: Snapshot) -> Text:
@@ -182,19 +242,34 @@ def render(
     port: str,
     fw: str,
     poll_hz: float,
+    bench: Bench | None = None,
+    height: int = 40,
 ) -> RenderableType:
-    body = Group(
+    commands = (
+        render_commands(bench, compact=height < COMPACT_BELOW) if bench is not None else None
+    )
+    command_lines = commands.row_count + 2 if commands is not None else 0
+    lines = log_capacity(height, command_lines)
+
+    parts: list[RenderableType] = [
         render_status(snapshot, port=port, fw=fw, poll_hz=poll_hz),
         Text(),
         render_channels(snapshot),
         render_loop(snapshot),
         Text(),
-        *[Text(line.text, style="" if line.ok else "red") for line in log[-LOG_LINES:]],
+    ]
+    if commands is not None:
+        parts += [Panel(commands, title="commands", title_align="left", border_style="dim"), Text()]
+    parts += [
+        *[Text(line.text, style="" if line.ok else "red") for line in log[-lines:]],
         Text(),
         Text.assemble(("> ", "bold cyan"), (prompt, "bold"), ("_", "dim")),
-        Text("Ctrl-E: EMERGENCY STOP", style="red"),
+    ]
+    return Panel(
+        Group(*parts),
+        title="NextGen Stand bench",
+        subtitle="[red]Ctrl-E: EMERGENCY STOP[/red]  ·  chain with ';'  ·  Q to quit",
     )
-    return Panel(body, title="NextGen Stand bench", subtitle="? for help, Q to quit")
 
 
 class Dashboard:
@@ -252,6 +327,11 @@ class Dashboard:
         self.poll()
 
     def _log_result(self, result: CommandResult) -> None:
+        if result.show_help:
+            # The reference is on screen already; reprinting it would push
+            # everything else out of the log, which is the bug this fixed.
+            self.log.append(LogLine("commands are in the panel above"))
+            return
         if result.show_status:
             status = self.snapshot.status
             text = "no status yet" if status is None else (
@@ -280,7 +360,9 @@ class Dashboard:
         except Exception as exc:  # noqa: BLE001 -- the header just shows "?"
             self.log.append(LogLine(f"could not read device info: {exc}", ok=False))
 
-        self.log.append(LogLine(help_text(self.bench)))
+        # No help dump here any more: it is on screen permanently now, and
+        # sixteen lines of it was exactly what pushed everything else out of
+        # the log.
         self.poll()
 
         next_poll = time.monotonic() + POLL_INTERVAL
@@ -316,4 +398,6 @@ class Dashboard:
             port=self.port,
             fw=self.fw,
             poll_hz=self.poll_hz,
+            bench=self.bench,
+            height=self.console.size.height,
         )
