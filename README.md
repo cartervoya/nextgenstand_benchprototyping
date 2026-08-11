@@ -345,12 +345,9 @@ autotune survives closing the terminal — and a second Teensy on the bench does
 not inherit the first one's tuning.
 
 ```powershell
-.\.venv\Scripts
-gs.exe gains                  # show them, and where they came from
-.\.venv\Scripts
-gs.exe gains --kp 0.16        # set and save
-.\.venv\Scripts
-gs.exe gains --reset          # discard, back to BENCH_CONFIG
+.\.venv\Scripts\ngs.exe gains                  # show them, and where they came from
+.\.venv\Scripts\ngs.exe gains --kp 0.16        # set and save
+.\.venv\Scripts\ngs.exe gains --reset          # discard, back to BENCH_CONFIG
 ```
 
 The file is meant to be committed: it diffs, so "kp went from 0.16 to 0.31 on
