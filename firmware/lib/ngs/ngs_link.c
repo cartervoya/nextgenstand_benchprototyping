@@ -78,6 +78,17 @@ size_t ngs_cobs_decode(const uint8_t *src, size_t len, uint8_t *dst, size_t dst_
             return NGS_COBS_ERROR;
         }
 
+        /* A zero among the data bytes is not valid COBS -- removing zeros is
+         * the entire point of the encoding. The framing layer cannot deliver
+         * one (it splits on 0x00 before decoding), so reaching here means the
+         * caller handed us something that is not a COBS body. Reject it rather
+         * than pass the byte through and let it look like real payload. */
+        for (size_t i = 0; i < run; i++) {
+            if (src[read + i] == 0) {
+                return NGS_COBS_ERROR;
+            }
+        }
+
         memcpy(&dst[write], &src[read], run);
         read += run;
         write += run;

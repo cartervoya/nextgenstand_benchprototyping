@@ -92,7 +92,15 @@ def cobs_decode(src: bytes) -> bytes:
         if read + run > n:
             raise FramingError(ErrCode.BAD_LENGTH, "COBS run overruns the frame")
 
-        out += src[read : read + run]
+        chunk = src[read : read + run]
+        # A zero among the data bytes is not valid COBS -- removing zeros is
+        # the entire point of the encoding. See the matching check in
+        # ngs_link.c; the two must agree or a frame one side rejects is a
+        # frame the other side acts on.
+        if 0 in chunk:
+            raise FramingError(ErrCode.BAD_LENGTH, "0x00 inside a COBS body")
+
+        out += chunk
         read += run
 
         # A code < 0xFF means the run was terminated by a zero -- unless we just

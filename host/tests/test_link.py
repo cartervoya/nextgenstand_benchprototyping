@@ -66,8 +66,26 @@ def test_cobs_matches_the_reference_implementation():
 
 
 def test_cobs_rejects_an_embedded_zero():
+    """The same vector the on-target C test uses: a code byte claiming two
+    data bytes, the second of which is 0x00.
+
+    Note the shape -- an earlier version of this test used a 4-byte input that
+    passed for the wrong reason, tripping the run-past-end check before ever
+    reaching the zero. The C implementation had the gap this was supposed to
+    catch, and only the on-target run exposed it.
+    """
     with pytest.raises(FramingError):
-        cobs_decode(b"\x03a\x00b")
+        cobs_decode(bytes([0x03, 0x11, 0x00]))
+
+
+def test_cobs_rejects_a_zero_code_byte():
+    with pytest.raises(FramingError):
+        cobs_decode(bytes([0x00, 0x11]))
+
+
+def test_cobs_rejects_a_run_that_overruns_the_input():
+    with pytest.raises(FramingError):
+        cobs_decode(bytes([0x05, 0x11]))  # claims 4 data bytes, one present
 
 
 def decode_one(data: bytes) -> list:
