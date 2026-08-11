@@ -98,6 +98,13 @@ def snapshot_to_dict(snapshot: Snapshot, port: str, fw: str) -> dict[str, Any]:
             "flags": snapshot.control.flag_names(),
             "faults": snapshot.control.fault_count,
         },
+        "estop": None
+        if snapshot.status is None
+        else {
+            "latched": snapshot.status.estopped,
+            "source": snapshot.status.estop_source_name.lower(),
+            "safe_entries": snapshot.status.safe_entries,
+        },
         "status": None
         if snapshot.status is None
         else {
@@ -216,12 +223,20 @@ PAGE = """<!doctype html>
   button { background:var(--accent); border:0; border-radius:6px; color:#11131a;
            padding:9px 18px; font:inherit; font-weight:700; cursor:pointer; }
   .stop { background:var(--bad); color:#fff; }
+  /* Deliberately the largest thing on the page. */
+  .estop { width:100%; background:var(--bad); color:#fff; font-size:20px;
+           font-weight:800; letter-spacing:2px; padding:16px; margin-bottom:12px;
+           border:0; border-radius:8px; cursor:pointer; }
+  .estop:hover { filter:brightness(1.15); }
+  .estop.latched { background:#7a1620; color:#ffb3b3; }
   .loop { color:#c678dd; margin-bottom:10px; min-height:1.4em; }
   .loop.warn { color:var(--warn); } .loop.bad { color:var(--bad); font-weight:700; }
 </style>
 </head>
 <body><main>
   <h1>NextGen Stand bench</h1>
+  <button type="button" class="estop" id="estopbtn"
+          title="Everything to its safe state, latched (or press Escape)">EMERGENCY STOP</button>
   <div class="bar ok" id="bar">connecting...</div>
   <table id="channels"></table>
   <div id="loop" class="loop"></div>
@@ -249,7 +264,19 @@ function log(text, cls) {
 }
 
 function render(s) {
-  const bar = $("bar");
+  const bar = $("bar"), btn = $("estopbtn");
+  const latched = s.estop && s.estop.latched;
+  btn.classList.toggle("latched", !!latched);
+  btn.textContent = latched ? "LATCHED - click to clear" : "EMERGENCY STOP";
+
+  if (latched) {
+    bar.className = "bar bad";
+    bar.textContent = s.port + "  *** EMERGENCY STOP LATCHED (" + s.estop.source
+                    + ") ***  outputs are safe and will not move.";
+    $("channels").innerHTML = channelRows(s);
+    $("loop").textContent = "";
+    return;
+  }
   if (s.error) {
     bar.className = "bar bad";
     bar.textContent = s.port + "  LINK ERROR  " + s.error;
@@ -283,7 +310,11 @@ function render(s) {
       + (ct.flags.length ? "   [" + ct.flags.join(" ") + "]" : "");
   }
 
-  $("channels").innerHTML = s.channels.map(c => {
+  $("channels").innerHTML = channelRows(s);
+}
+
+function channelRows(s) {
+  return s.channels.map(c => {
     let cls = "num";
     if (c.kind === "valve") cls = c.mismatch ? "bad" : (c.state === "open" ? "open" : "closed");
     if (c.kind === "analog" && c.faulted) cls = "bad";
@@ -332,6 +363,13 @@ $("form").addEventListener("submit", (e) => {
   $("line").value = "";
 });
 $("stopbtn").addEventListener("click", () => send("X"));
+$("estopbtn").addEventListener("click", () => send(
+  $("estopbtn").classList.contains("latched") ? "EC" : "!"));
+// Escape is the E-stop here: no line to finish, works from anywhere on
+// the page including while typing a command.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { e.preventDefault(); send("!"); }
+});
 $("line").addEventListener("keydown", (e) => {   // arrow-key history
   if (e.key === "ArrowUp" && hpos > 0) { $("line").value = history[--hpos]; e.preventDefault(); }
   if (e.key === "ArrowDown") {

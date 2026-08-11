@@ -85,6 +85,13 @@ class FakeDevice:
         self.stream_seq = 0
         self._stream_next_us = 0
 
+        # Emergency stop, mirroring ngs_app.c.
+        self.estop = False
+        self.estop_source = p.EstopSource.NONE
+        self.safe_entries: dict[int, p.SafeEntry] = {}
+        self.watchdog_ms = 0
+        self.last_rx_us = self.board.micros()
+
         self.control = FakeController()
         self.control_pin = 0
         self.control_bits = 0
@@ -101,6 +108,7 @@ class FakeDevice:
         return len(data)
 
     def read(self, size: int = 1) -> bytes:
+        self._poll_watchdog()
         self._poll_control()
         self._poll_stream()
         out = bytes(self._tx[:size])
@@ -111,6 +119,7 @@ class FakeDevice:
     def in_waiting(self) -> int:
         """Bytes ready to read, as pyserial reports it. Present so the driver
         takes the same code path here as against a real port."""
+        self._poll_watchdog()
         self._poll_control()
         self._poll_stream()
         return len(self._tx)
@@ -141,7 +150,76 @@ class FakeDevice:
 
     # -- dispatch ----------------------------------------------------------
 
+    # -- emergency stop ----------------------------------------------------
+
+    def _apply_safe_state(self) -> None:
+        """Every registered output to its safe value, and the pump back from
+        the controller. Mirrors app_apply_safe_state()."""
+        from dataclasses import replace
+
+        self.control.configure(replace(self.control.cfg, mode=p.PumpMode.MANUAL), 0.0)
+        self.control.output = 0.0
+
+        for entry in self.safe_entries.values():
+            if entry.kind == p.SafeKind.GPIO:
+                self.board.pin_modes[entry.pin] = p.PinMode.OUTPUT
+                self.board.pin_values[entry.pin] = entry.value
+            else:
+                freq = self.board.pwm.get(entry.pin, (0, 0, 0))[1]
+                self.board.pwm[entry.pin] = (entry.value, freq, entry.resolution)
+
+    def engage_estop(self, source: int = p.EstopSource.COMMAND) -> None:
+        if not self.estop:
+            self.estop = True
+            self.estop_source = source
+        self._apply_safe_state()
+
+    def _estop(self, frame: Frame) -> p.ErrCode | None:
+        req = self._unpack(p.EstopCmd, frame)
+        if req is None:
+            return p.ErrCode.BAD_PAYLOAD
+        if req.action == p.EstopAction.ENGAGE:
+            self.engage_estop(p.EstopSource.COMMAND)
+        elif req.action == p.EstopAction.CLEAR:
+            self.estop = False
+            self.estop_source = p.EstopSource.NONE
+        else:
+            return p.ErrCode.BAD_ARGUMENT
+        self._respond(frame)
+        return None
+
+    def _set_safe_entry(self, frame: Frame) -> p.ErrCode | None:
+        req = self._unpack(p.SafeEntry, frame)
+        if req is None:
+            return p.ErrCode.BAD_PAYLOAD
+
+        self.watchdog_ms = req.watchdog_ms
+
+        if req.index == p.SAFE_INDEX_CLEAR:
+            self.safe_entries.clear()
+            self._respond(frame)
+            return None
+        if req.index >= p.SAFE_MAX_ENTRIES:
+            return p.ErrCode.BAD_ARGUMENT
+        if req.kind > p.SafeKind.PWM or req.pin > p.MAX_DIGITAL_PIN:
+            return p.ErrCode.BAD_ARGUMENT
+        if req.kind == p.SafeKind.GPIO and req.value > 1:
+            return p.ErrCode.BAD_ARGUMENT
+        if req.kind == p.SafeKind.PWM and not 1 <= req.resolution <= 16:
+            return p.ErrCode.BAD_ARGUMENT
+
+        self.safe_entries[req.index] = req
+        self._respond(frame)
+        return None
+
+    def _poll_watchdog(self) -> None:
+        """The host has gone quiet -- see the comment in ngs_app.c."""
+        silent_us = self.board.micros() - self.last_rx_us
+        if self.watchdog_ms and not self.estop and silent_us > self.watchdog_ms * 1000:
+            self.engage_estop(p.EstopSource.WATCHDOG)
+
     def _dispatch(self, frame: Frame) -> None:
+        self.last_rx_us = self.board.micros()
         handler = {
             p.MsgType.PING: self._ping,
             p.MsgType.GET_INFO: self._get_info,
@@ -151,6 +229,8 @@ class FakeDevice:
             p.MsgType.GET_GPIO: self._get_gpio,
             p.MsgType.READ_ADC: self._read_adc,
             p.MsgType.WRITE_PWM: self._write_pwm,
+            p.MsgType.ESTOP: self._estop,
+            p.MsgType.SET_SAFE_ENTRY: self._set_safe_entry,
             p.MsgType.SET_STREAM: self._set_stream,
             p.MsgType.SET_CONTROL: self._set_control,
             p.MsgType.GET_CONTROL: self._get_control,
@@ -204,6 +284,9 @@ class FakeDevice:
             rx_overflows=self._decoder.overflows,
             loop_max_us=self.loop_max_us,
             temp_mc=self.board.temp_mc,
+            estop=1 if self.estop else 0,
+            estop_source=int(self.estop_source),
+            safe_entries=(max(self.safe_entries) + 1) if self.safe_entries else 0,
         )
         self._respond(frame, status.pack())
         self.loop_max_us = 0  # read-and-clear, as in handle_get_status()
@@ -215,6 +298,8 @@ class FakeDevice:
         return None
 
     def _set_gpio(self, frame: Frame) -> p.ErrCode | None:
+        if self.estop:
+            return p.ErrCode.ESTOP
         req = self._unpack(p.GpioSet, frame)
         if req is None:
             return p.ErrCode.BAD_PAYLOAD
@@ -262,6 +347,8 @@ class FakeDevice:
         return None
 
     def _write_pwm(self, frame: Frame) -> p.ErrCode | None:
+        if self.estop:
+            return p.ErrCode.ESTOP
         req = self._unpack(p.PwmWrite, frame)
         if req is None:
             return p.ErrCode.BAD_PAYLOAD
@@ -294,6 +381,9 @@ class FakeDevice:
         req = self._unpack(p.ControlCfg, frame)
         if req is None:
             return p.ErrCode.BAD_PAYLOAD
+        # Manual is always allowed -- it is a way *out* of driving something.
+        if self.estop and req.mode != p.PumpMode.MANUAL:
+            return p.ErrCode.ESTOP
         err = self.control.configure(req, self.control.output)
         if err:
             return p.ErrCode(err)
@@ -308,6 +398,8 @@ class FakeDevice:
         req = self._unpack(p.AutotuneCmd, frame)
         if req is None:
             return p.ErrCode.BAD_PAYLOAD
+        if self.estop and req.action != p.AutotuneAction.ABORT:
+            return p.ErrCode.ESTOP
         err = self.control.start_autotune(req, self.board.micros(), self.control.output)
         if err:
             return p.ErrCode(err)

@@ -353,6 +353,38 @@ class Device:
                 raise ValueError(f"channel mask 0x{mask:X} exceeds A{p.MAX_ADC_CHANNEL}")
         self._transact(p.MsgType.SET_STREAM, p.StreamCfg(int(enable), period_us, mask).pack())
 
+    # -- emergency stop ----------------------------------------------------
+
+    def estop(self) -> None:
+        """Latch the emergency stop.
+
+        The device drives every registered safe-state output immediately and
+        refuses to drive anything again until `clear_estop()`. It does not need
+        the host for any of that -- see `set_safe_entry`.
+        """
+        self._transact(p.MsgType.ESTOP, p.EstopCmd(p.EstopAction.ENGAGE).pack())
+
+    def clear_estop(self) -> None:
+        """Release the latch. Moves nothing: every output stays at its safe
+        value until something is explicitly commanded."""
+        self._transact(p.MsgType.ESTOP, p.EstopCmd(p.EstopAction.CLEAR).pack())
+
+    def set_safe_entry(self, entry: p.SafeEntry) -> None:
+        """Register one output's safe value, and the watchdog timeout.
+
+        The device has no idea what a valve is, so it is told up front where
+        every output should go in an emergency. That is what lets it reach a
+        safe state when the host is not there to ask.
+        """
+        self._transact(p.MsgType.SET_SAFE_ENTRY, entry.pack())
+
+    def clear_safe_table(self, watchdog_ms: int = 0) -> None:
+        """Forget every registered output, so a reconnecting host cannot leave
+        a stale entry behind for something no longer wired."""
+        self.set_safe_entry(
+            p.SafeEntry(index=p.SAFE_INDEX_CLEAR, watchdog_ms=watchdog_ms)
+        )
+
     # -- closed-loop control -----------------------------------------------
 
     def set_control(self, cfg: p.ControlCfg) -> None:

@@ -212,6 +212,14 @@ class BenchConfig:
     pwms: tuple[PwmOutputSpec, ...] = ()
     controls: tuple[ControlSpec, ...] = ()
 
+    #: Host-silence watchdog, milliseconds. 0 disables it.
+    #:
+    #: Off by default, and switched on by the dashboards while they are
+    #: supervising. A watchdog that fires whenever no host is connected would
+    #: also undo a valve you deliberately set from a one-shot command and then
+    #: walked away from -- which is ordinary bench use, not an emergency.
+    watchdog_ms: int = 0
+
     def by_code(self) -> dict[str, ValveSpec | AnalogInputSpec | PwmOutputSpec]:
         """Command code -> spec, for the parser and the CLI. Codes are matched
         case-insensitively, so they are stored uppercase."""
@@ -605,13 +613,17 @@ class Bench:
 
     # -- setup -------------------------------------------------------------
 
-    def initialize(self) -> None:
+    def initialize(self, watchdog_ms: int | None = None) -> None:
         """Put the bench in a known safe state: valves closed, PWM at its
         default, PWM frequency and resolution configured.
 
         Safe to call on an already-running bench -- it is also how you recover
         after the board resets underneath you.
         """
+        # Register where every output belongs in an emergency before driving
+        # anything, so the device can get there without us from this point on.
+        self.register_safe_state(watchdog_ms)
+
         # Same reason as stop(): a running loop would refuse the PWM writes.
         for spec in self.config.controls:
             self.set_pump_mode(False, output=spec.output)
@@ -638,6 +650,75 @@ class Bench:
             self.set_pwm(pwm.name, pwm.default_percent)
         for valve in self.config.valves:
             self.set_valve(valve.name, False)
+
+    # -- emergency stop ----------------------------------------------------
+
+    def register_safe_state(self, watchdog_ms: int | None = None) -> None:
+        """Tell the device where every output belongs in an emergency.
+
+        Sent up front, so the device can reach a safe state on its own -- when
+        the host has crashed, or the cable is out. That is the difference
+        between an emergency stop and a convenience command.
+        """
+        timeout = self.config.watchdog_ms if watchdog_ms is None else watchdog_ms
+        self.device.clear_safe_table(watchdog_ms=timeout)
+
+        index = 0
+        for valve in self.config.valves:
+            self.device.set_safe_entry(
+                p.SafeEntry(
+                    index=index,
+                    kind=p.SafeKind.GPIO,
+                    pin=valve.pin,
+                    value=valve.level_for(False),
+                    watchdog_ms=timeout,
+                )
+            )
+            index += 1
+
+        for pwm in self.config.pwms:
+            self.device.set_safe_entry(
+                p.SafeEntry(
+                    index=index,
+                    kind=p.SafeKind.PWM,
+                    pin=pwm.pin,
+                    value=pwm.to_counts(pwm.default_percent),
+                    resolution=pwm.resolution,
+                    watchdog_ms=timeout,
+                )
+            )
+            index += 1
+
+    def estop(self) -> None:
+        """Latch the emergency stop.
+
+        One message. The device drives every output to its safe value itself,
+        so this cannot half-succeed the way a sequence of individual commands
+        can -- and it stays latched until explicitly cleared.
+
+        Registers the safe-state table first if the device does not have one.
+        Without that check, an emergency stop issued from a process that never
+        called `initialize()` -- `ngs estop` against a freshly booted board,
+        say -- would latch correctly and drive nothing at all, which is the
+        worst possible way to fail. The extra status read costs a fraction of
+        a millisecond against the 0.3 ms the stop itself takes.
+        """
+        if self.device.status().safe_entries == 0:
+            self.register_safe_state()
+
+        self.device.estop()
+        for pwm in self.config.pwms:
+            self._pwm_percent[pwm.name] = pwm.default_percent
+        for valve in self.config.valves:
+            self._valve_commanded[valve.name] = False
+
+    def clear_estop(self) -> None:
+        """Release the latch. Nothing moves -- outputs stay safe until
+        commanded."""
+        self.device.clear_estop()
+
+    def is_estopped(self) -> bool:
+        return self.device.status().estopped
 
     # -- outputs -----------------------------------------------------------
 
@@ -719,7 +800,9 @@ class Bench:
                 for s in self.config.pwms
             }
             status = self.device.status() if include_status else None
-            control = self.device.control() if self.config.controls else None
+            # Deliberately not re-read here: the loop runs at 50 Hz, so a second
+            # query would return a slightly different output and the snapshot
+            # would show a duty that disagrees with its own control state.
         except (p.NgsError, OSError, TimeoutError) as exc:
             return Snapshot(monotonic=time.monotonic(), error=f"{type(exc).__name__}: {exc}")
 

@@ -34,8 +34,10 @@ extern "C" {
 
 /* Bumped on any incompatible change to framing, message ids, or struct layout.
  *
- * v2 added the closed-loop pump controller (0x30..0x33) and its payloads. */
-#define NGS_PROTO_VERSION 2
+ * v2 added the closed-loop pump controller (0x30..0x33) and its payloads.
+ * v3 added the emergency stop, its safe-state table, and the host-silence
+ *    watchdog; NgsStatusPayload grew the latch state. */
+#define NGS_PROTO_VERSION 3
 
 /* Largest payload either side will emit or accept. Keeps every buffer static. */
 #define NGS_MAX_PAYLOAD 512u
@@ -53,6 +55,8 @@ extern "C" {
 #define NGS_MSG_GET_INFO 0x02u   /* -> (empty)            <- NgsInfoPayload   */
 #define NGS_MSG_GET_STATUS 0x03u /* -> (empty)            <- NgsStatusPayload */
 #define NGS_MSG_RESET 0x04u      /* -> (empty)            <- (empty), then reboot */
+#define NGS_MSG_ESTOP 0x05u      /* -> NgsEstopCmdPayload <- (empty)          */
+#define NGS_MSG_SET_SAFE_ENTRY 0x06u /* -> NgsSafeEntryPayload <- (empty)     */
 
 #define NGS_MSG_SET_GPIO 0x10u  /* -> NgsGpioSetPayload  <- (empty)          */
 #define NGS_MSG_GET_GPIO 0x11u  /* -> NgsGpioGetPayload  <- NgsGpioGetPayload */
@@ -85,6 +89,7 @@ extern "C" {
 #define NGS_ERR_OVERFLOW 0x06u      /* frame exceeded NGS_MAX_PAYLOAD        */
 #define NGS_ERR_NOT_SUPPORTED 0x07u /* valid request, unimplemented here     */
 #define NGS_ERR_BUSY 0x08u          /* transient; retry is reasonable        */
+#define NGS_ERR_ESTOP 0x09u         /* refused: the emergency stop is latched */
 
 /* ---------------------------------------------------------------------------
  * Payload layouts
@@ -124,7 +129,70 @@ typedef struct NGS_PACKED {
     uint32_t rx_overflows; /* frames dropped for exceeding NGS_MAX_PAYLOAD */
     uint32_t loop_max_us;  /* longest loop() iteration since last status   */
     int32_t temp_mc;       /* die temperature, milli-degrees C             */
+    uint8_t estop;         /* 1 while the emergency stop is latched        */
+    uint8_t estop_source;  /* NGS_ESTOP_SRC_*                              */
+    uint8_t safe_entries;  /* slots the host has registered                */
+    uint8_t _pad;
 } NgsStatusPayload;
+
+/* ---------------------------------------------------------------------------
+ * Emergency stop
+ *
+ * The device holds its own safe state and can reach it without being told to,
+ * which is the whole point: a stop that only works while the host is alive and
+ * the cable is in is not an emergency stop. Three things get you there:
+ *
+ *   1. NGS_MSG_ESTOP from the host. Latching, so it stays stopped until
+ *      explicitly cleared -- a stop you can undo by accident is not a stop.
+ *   2. The watchdog below: if the host goes quiet for longer than
+ *      `watchdog_ms`, the device assumes the worst and latches by itself.
+ *   3. Any output command while latched is refused with NGS_ERR_ESTOP, so
+ *      nothing can be driven again until an operator clears it.
+ *
+ * The safe state is a table the host registers up front, because the device
+ * has no idea what a valve is. Registering it in advance is what lets the
+ * device act alone at 2 and 3 above.
+ * ------------------------------------------------------------------------- */
+
+#define NGS_ESTOP_ACTION_CLEAR 0x00u
+#define NGS_ESTOP_ACTION_ENGAGE 0x01u
+
+/* Why the device is latched, reported in NgsStatusPayload. */
+#define NGS_ESTOP_SRC_NONE 0x00u
+#define NGS_ESTOP_SRC_COMMAND 0x01u  /* the host asked for it                */
+#define NGS_ESTOP_SRC_WATCHDOG 0x02u /* the host stopped talking             */
+
+typedef struct NGS_PACKED {
+    uint8_t action; /* NGS_ESTOP_ACTION_*                                    */
+    uint8_t _pad[3];
+} NgsEstopCmdPayload;
+
+/* How many outputs the safe-state table can hold. Eight covers this bench
+ * several times over and costs 48 bytes. */
+#define NGS_SAFE_MAX_ENTRIES 8u
+
+#define NGS_SAFE_KIND_GPIO 0x00u
+#define NGS_SAFE_KIND_PWM 0x01u
+
+/* Index 0xFF clears the whole table rather than setting a slot -- so a host
+ * that reconnects and re-registers cannot leave a stale entry behind for an
+ * output that is no longer wired. */
+#define NGS_SAFE_INDEX_CLEAR 0xFFu
+
+/* NGS_MSG_SET_SAFE_ENTRY: one output per message.
+ *
+ * One at a time rather than an array in a single message: it keeps every
+ * payload a flat struct of scalars, which is what makes the host mirror
+ * verifiable field by field. Four round trips at connect costs nothing. */
+typedef struct NGS_PACKED {
+    uint8_t index; /* slot, or NGS_SAFE_INDEX_CLEAR                          */
+    uint8_t kind;  /* NGS_SAFE_KIND_*                                        */
+    uint8_t pin;
+    uint8_t _pad;
+    uint16_t value;      /* GPIO: 0 or 1. PWM: duty in counts               */
+    uint16_t resolution; /* PWM only: bits, so duty means something          */
+    uint32_t watchdog_ms; /* 0 disables. Applied on every message; last wins */
+} NgsSafeEntryPayload;
 
 /* NGS_MSG_SET_GPIO request. mode selects the pinMode applied before writing. */
 typedef struct NGS_PACKED {

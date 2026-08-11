@@ -157,6 +157,13 @@ def bench(
     no_init: Annotated[
         bool, typer.Option("--no-init", help="Do not force a safe state on start.")
     ] = False,
+    watchdog: Annotated[
+        int,
+        typer.Option(
+            "--watchdog",
+            help="Latch the E-stop if the host goes quiet for this many ms. 0 disables.",
+        ),
+    ] = 0,
 ) -> None:
     """Live dashboard: polls at 2 Hz and takes commands (V1O; P50; ...)."""
     # Checked before opening the port: if we cannot run, there is no reason to
@@ -172,7 +179,7 @@ def bench(
     obj, label = _open(port, sim, timeout)
     with obj.device:
         if not no_init:
-            obj.initialize()
+            obj.initialize(watchdog_ms=watchdog)
         try:
             Dashboard(obj, port=label, console=console).run()
         finally:
@@ -343,6 +350,13 @@ def web(
     port: PortOpt = None,
     sim: SimOpt = False,
     timeout: TimeoutOpt = 1.0,
+    watchdog: Annotated[
+        int,
+        typer.Option(
+            "--watchdog",
+            help="Latch the E-stop if the host goes quiet for this many ms. 0 disables.",
+        ),
+    ] = 0,
 ) -> None:
     """Serve the dashboard as a local web page, for a separate window.
 
@@ -357,7 +371,7 @@ def web(
     url = f"http://127.0.0.1:{http_port}/"
 
     with obj.device:
-        obj.initialize()
+        obj.initialize(watchdog_ms=watchdog)
         state = WebBench(obj, label)
         try:
             state.fw = obj.device.info().fw_version
@@ -384,6 +398,37 @@ def web(
             server.server_close()
             # Never leave the pump running because a browser tab was closed.
             obj.stop()
+
+
+@app.command()
+def estop(
+    clear: Annotated[
+        bool, typer.Option("--clear", help="Release the latch instead of engaging it.")
+    ] = False,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+) -> None:
+    """Emergency stop: everything to its safe state, latched.
+
+    The device does the work and stays latched until cleared, so this cannot
+    half-succeed and cannot be undone by accident.
+    """
+    obj, _ = _open(port, sim)
+    with obj.device:
+        if clear:
+            obj.clear_estop()
+            console.print(
+                "emergency stop cleared. Nothing moved -- outputs are still safe."
+            )
+            return
+
+        obj.estop()
+        status = obj.device.status()
+        console.print("[bold white on red] EMERGENCY STOP ENGAGED [/bold white on red]")
+        console.print(
+            f"{status.safe_entries} outputs driven to their safe state and latched. "
+            "Run `ngs estop --clear` to release."
+        )
 
 
 @app.command()

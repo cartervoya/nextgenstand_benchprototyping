@@ -69,6 +69,10 @@ static bool round_trip(uint8_t type, uint8_t seq, const void *payload, uint16_t 
     return take_response(out);
 }
 
+/* The emergency stop tests use the helpers above, so they are included
+ * here rather than at the top of the file. */
+#include "test_estop.h"
+
 /* ---- CRC --------------------------------------------------------------- */
 
 static void test_crc16_known_vector(void)
@@ -264,7 +268,8 @@ static void test_payload_sizes_match_host(void)
      * this is the cheapest place to catch it. */
     TEST_ASSERT_EQUAL_MESSAGE(4, sizeof(NgsPongPayload), "NgsPongPayload");
     TEST_ASSERT_EQUAL_MESSAGE(20, sizeof(NgsInfoPayload), "NgsInfoPayload");
-    TEST_ASSERT_EQUAL_MESSAGE(28, sizeof(NgsStatusPayload), "NgsStatusPayload");
+    /* 28 bytes of counters plus the four-byte emergency-stop block. */
+    TEST_ASSERT_EQUAL_MESSAGE(32, sizeof(NgsStatusPayload), "NgsStatusPayload");
     TEST_ASSERT_EQUAL_MESSAGE(4, sizeof(NgsGpioSetPayload), "NgsGpioSetPayload");
     TEST_ASSERT_EQUAL_MESSAGE(4, sizeof(NgsGpioGetPayload), "NgsGpioGetPayload");
     TEST_ASSERT_EQUAL_MESSAGE(8, sizeof(NgsAdcReadPayload), "NgsAdcReadPayload");
@@ -656,6 +661,7 @@ void setup()
     RUN_TEST(test_multiple_frames_in_one_poll);
 
     register_control_tests();
+    register_estop_tests();
 
     UNITY_END();
 }

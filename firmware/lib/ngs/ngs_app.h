@@ -45,6 +45,20 @@ typedef struct {
     uint32_t loop_max_us;
     uint32_t last_poll_us;
 
+    /* Emergency stop. Latched: once engaged it stays engaged until the host
+     * explicitly clears it. The safe-state table is registered by the host in
+     * advance so the device can reach a safe state on its own -- which is what
+     * makes the watchdog below possible at all. */
+    bool estop;
+    uint8_t estop_source; /* NGS_ESTOP_SRC_* */
+    uint8_t safe_count;
+    uint8_t safe_kind[NGS_SAFE_MAX_ENTRIES];
+    uint8_t safe_pin[NGS_SAFE_MAX_ENTRIES];
+    uint16_t safe_value[NGS_SAFE_MAX_ENTRIES];
+    uint16_t safe_resolution[NGS_SAFE_MAX_ENTRIES];
+    uint32_t watchdog_ms; /* 0 disables */
+    uint32_t last_rx_us;  /* when the host last got a frame through */
+
     /* Closed-loop pump control. Runs on its own period inside ngs_app_poll,
      * independent of how often the host talks to us. */
     NgsControl control;

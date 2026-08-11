@@ -175,8 +175,10 @@ rate drops rather than claiming 2 Hz over stale numbers.
 | `KF1.5` `KB2` | measurement filter seconds / integration deadband |
 | `T240` `T?` `TA` `TX` | autotune / progress / adopt gains / abort |
 | `F?` | read the flow meter |
+| `!` or `E` | **EMERGENCY STOP** — everything safe, latched (`Ctrl-E` needs no Enter) |
+| `EC` | clear the emergency stop |
 | `S` | device status counters |
-| `X` | stop: pump to 0, valves closed |
+| `X` | soft stop: pump to 0, valves closed, not latched |
 | `Z` | re-initialise to the safe state |
 | `Q` | quit |
 
@@ -196,6 +198,48 @@ with Device.open() as dev:
     bench.set_pwm("pump", 40.0)
     print(bench.read_analog("flow").value, "mL/min")
 ```
+
+## Emergency stop
+
+`Ctrl-E` in the terminal dashboard, the big red button (or `Escape`) in the
+browser, `!` as a command, `ngs estop` from a shell. All four do the same
+thing:
+
+```
+!        everything to its safe state, latched
+EC       clear the latch
+```
+
+Three properties make it a stop rather than a convenience command:
+
+**It is one message, and the device does the work.** The board holds its own
+safe-state table — registered by the host at connect, because the device has
+no idea what a valve is — and drives every output itself. A sequence of
+individual commands can half-succeed; this cannot.
+
+**It latches.** While engaged, every command that would drive an output is
+refused with `ESTOP`: GPIO writes, PWM writes, entering auto, starting an
+autotune. Reads keep working, because a stopped bench is exactly when you want
+to see what it is doing. Returning the loop to manual is also allowed — that is
+a way *out* of driving something.
+
+Clearing the latch moves nothing. Outputs stay at their safe values until
+something is explicitly commanded again.
+
+**It does not need the host.** With the watchdog enabled, the device latches by
+itself if the host stops talking for longer than the timeout — the case a
+host-side stop can never cover, because by then the host is the thing that
+failed. The dashboards switch it on while they are supervising:
+
+```powershell
+.\.venv\Scripts
+gs.exe bench --watchdog 3000    # latch after 3 s of silence
+```
+
+It is **off by default**, and deliberately so: a watchdog that fires whenever
+no host is connected would also undo a valve you set from a one-shot command
+and then walked away from, which is ordinary bench use rather than an
+emergency. Set `watchdog_ms` in `BENCH_CONFIG` to make it always-on.
 
 ## Closed-loop flow control
 

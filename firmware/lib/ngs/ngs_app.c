@@ -55,6 +55,107 @@ void ngs_app_log(NgsApp *app, const char *msg)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Emergency stop                                                            */
+/* ------------------------------------------------------------------------ */
+
+/* Drives every registered output to its safe value and takes the pump back
+ * from the controller. Called on engage and by the watchdog, so it must not
+ * depend on the host being there. */
+static void app_apply_safe_state(NgsApp *app)
+{
+    /* The controller first: left in AUTO it would drive the pump straight back
+     * up on its next tick, a few milliseconds from now. */
+    NgsControlCfgPayload manual = app->control.cfg;
+    manual.mode = NGS_PUMP_MODE_MANUAL;
+    (void)ngs_control_configure(&app->control, &manual, 0.0f);
+    app->control.output = 0.0f;
+
+    for (uint8_t i = 0; i < app->safe_count; i++) {
+        if (app->safe_kind[i] == NGS_SAFE_KIND_GPIO) {
+            (void)ngs_board_pin_mode(app->safe_pin[i], NGS_PIN_MODE_OUTPUT);
+            (void)ngs_board_gpio_write(app->safe_pin[i], (uint8_t)app->safe_value[i]);
+        } else {
+            (void)ngs_board_pwm_write(app->safe_pin[i], app->safe_value[i], 0,
+                                      (uint8_t)app->safe_resolution[i]);
+        }
+    }
+}
+
+static void app_engage_estop(NgsApp *app, uint8_t source)
+{
+    if (!app->estop) {
+        app->estop = true;
+        app->estop_source = source;
+    }
+    /* Re-applied even when already latched: cheap, and it puts back any pin
+     * that somehow got driven while the latch was set. */
+    app_apply_safe_state(app);
+}
+
+static int handle_estop(NgsApp *app, const NgsFrame *req)
+{
+    if (req->len != sizeof(NgsEstopCmdPayload)) {
+        return NGS_ERR_BAD_PAYLOAD;
+    }
+    NgsEstopCmdPayload p;
+    memcpy(&p, req->payload, sizeof(p));
+
+    if (p.action == NGS_ESTOP_ACTION_ENGAGE) {
+        app_engage_estop(app, NGS_ESTOP_SRC_COMMAND);
+    } else if (p.action == NGS_ESTOP_ACTION_CLEAR) {
+        /* Clearing releases the latch but moves nothing: every output stays at
+         * its safe value until something is explicitly commanded. */
+        app->estop = false;
+        app->estop_source = NGS_ESTOP_SRC_NONE;
+    } else {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
+
+    app_send_ack(app, req);
+    return 0;
+}
+
+static int handle_set_safe_entry(NgsApp *app, const NgsFrame *req)
+{
+    if (req->len != sizeof(NgsSafeEntryPayload)) {
+        return NGS_ERR_BAD_PAYLOAD;
+    }
+    NgsSafeEntryPayload p;
+    memcpy(&p, req->payload, sizeof(p));
+
+    app->watchdog_ms = p.watchdog_ms;
+
+    if (p.index == NGS_SAFE_INDEX_CLEAR) {
+        app->safe_count = 0;
+        app_send_ack(app, req);
+        return 0;
+    }
+    if (p.index >= NGS_SAFE_MAX_ENTRIES) {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
+    if (p.kind > NGS_SAFE_KIND_PWM || p.pin > NGS_MAX_DIGITAL_PIN) {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
+    if (p.kind == NGS_SAFE_KIND_GPIO && p.value > 1u) {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
+    if (p.kind == NGS_SAFE_KIND_PWM && (p.resolution == 0u || p.resolution > 16u)) {
+        return NGS_ERR_BAD_ARGUMENT;
+    }
+
+    app->safe_kind[p.index] = p.kind;
+    app->safe_pin[p.index] = p.pin;
+    app->safe_value[p.index] = p.value;
+    app->safe_resolution[p.index] = p.resolution;
+    if (p.index >= app->safe_count) {
+        app->safe_count = (uint8_t)(p.index + 1u);
+    }
+
+    app_send_ack(app, req);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Command handlers                                                          */
 /*                                                                           */
 /* Each returns 0 after replying, or an NGS_ERR_* code for the caller to turn */
@@ -93,6 +194,9 @@ static int handle_get_status(NgsApp *app, const NgsFrame *req)
     st.rx_overflows = app->decoder.overflows;
     st.loop_max_us = app->loop_max_us;
     st.temp_mc = ngs_board_temp_mc();
+    st.estop = app->estop ? 1u : 0u;
+    st.estop_source = app->estop_source;
+    st.safe_entries = app->safe_count;
     app_send(app, (uint8_t)(req->type | NGS_MSG_RESP), req->seq, &st, sizeof(st));
 
     /* Read-and-clear: each GET_STATUS reports the worst loop since the last
@@ -103,6 +207,9 @@ static int handle_get_status(NgsApp *app, const NgsFrame *req)
 
 static int handle_set_gpio(NgsApp *app, const NgsFrame *req)
 {
+    if (app->estop) {
+        return NGS_ERR_ESTOP;
+    }
     if (req->len != sizeof(NgsGpioSetPayload)) {
         return NGS_ERR_BAD_PAYLOAD;
     }
@@ -166,6 +273,9 @@ static int handle_read_adc(NgsApp *app, const NgsFrame *req)
 
 static int handle_write_pwm(NgsApp *app, const NgsFrame *req)
 {
+    if (app->estop) {
+        return NGS_ERR_ESTOP;
+    }
     if (req->len != sizeof(NgsPwmWritePayload)) {
         return NGS_ERR_BAD_PAYLOAD;
     }
@@ -207,6 +317,11 @@ static int handle_set_control(NgsApp *app, const NgsFrame *req)
     NgsControlCfgPayload p;
     memcpy(&p, req->payload, sizeof(p));
 
+    /* Manual is always allowed -- it is a way *out* of driving something. */
+    if (app->estop && p.mode != NGS_PUMP_MODE_MANUAL) {
+        return NGS_ERR_ESTOP;
+    }
+
     int err = ngs_control_configure(&app->control, &p, app->control.output);
     if (err != 0) {
         return err;
@@ -230,6 +345,10 @@ static int handle_autotune(NgsApp *app, const NgsFrame *req)
     }
     NgsAutotuneCmdPayload p;
     memcpy(&p, req->payload, sizeof(p));
+
+    if (app->estop && p.action != NGS_AT_ACTION_ABORT) {
+        return NGS_ERR_ESTOP;
+    }
 
     int err = ngs_control_autotune(&app->control, &p, ngs_board_micros(), app->control.output);
     if (err != 0) {
@@ -299,6 +418,8 @@ static void app_dispatch(NgsApp *app, const NgsFrame *req)
     case NGS_MSG_GET_INFO:   err = handle_get_info(app, req); break;
     case NGS_MSG_GET_STATUS: err = handle_get_status(app, req); break;
     case NGS_MSG_RESET:      err = handle_reset(app, req); break;
+    case NGS_MSG_ESTOP:      err = handle_estop(app, req); break;
+    case NGS_MSG_SET_SAFE_ENTRY: err = handle_set_safe_entry(app, req); break;
     case NGS_MSG_SET_GPIO:   err = handle_set_gpio(app, req); break;
     case NGS_MSG_GET_GPIO:   err = handle_get_gpio(app, req); break;
     case NGS_MSG_READ_ADC:   err = handle_read_adc(app, req); break;
@@ -361,6 +482,7 @@ void ngs_app_init(NgsApp *app)
     ngs_decoder_init(&app->decoder);
     ngs_control_init(&app->control);
     app->last_poll_us = ngs_board_micros();
+    app->last_rx_us = app->last_poll_us;
 }
 
 /* Runs the control loop if it is due. Split out of ngs_app_poll to keep the
@@ -414,10 +536,20 @@ void ngs_app_poll(NgsApp *app)
         NgsFrame frame;
         int rc = ngs_decoder_push(&app->decoder, (uint8_t)b, &frame);
         if (rc == NGS_DECODE_FRAME) {
+            app->last_rx_us = now;
             app_dispatch(app, &frame);
         } else if (rc == NGS_DECODE_ERROR) {
             /* seq/type are unknown -- the frame never decoded. */
             app_send_error(app, app->decoder.last_error, 0, 0);
+        }
+    }
+
+    /* Host-silence watchdog. A stop that only works while the host is alive
+     * is not an emergency stop: if the process dies or the cable is pulled
+     * with the pump running, nothing else ever brings it down. */
+    if (app->watchdog_ms != 0u && !app->estop) {
+        if ((uint32_t)(now - app->last_rx_us) > app->watchdog_ms * 1000u) {
+            app_engage_estop(app, NGS_ESTOP_SRC_WATCHDOG);
         }
     }
 

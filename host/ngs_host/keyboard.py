@@ -20,6 +20,10 @@ ENTER = "\n"
 BACKSPACE = "\b"
 CTRL_C = "\x03"
 CTRL_D = "\x04"
+#: Emergency stop. A chord rather than a plain letter so it cannot be
+#: triggered by typing, and it needs no Enter -- an E-stop you have to
+#: finish typing is not an E-stop.
+CTRL_E = "\x05"
 
 
 def stdin_is_interactive() -> bool:
@@ -88,6 +92,11 @@ else:
         return "".join(out)
 
 
+class EmergencyStop(Exception):  # noqa: N818 -- not an error, a signal
+    """Ctrl-E was pressed. Raised out of the editor so the caller acts on it
+    immediately, without waiting for a line to be completed."""
+
+
 class LineEditor:
     """A one-line input buffer fed by `read_keys()`.
 
@@ -104,10 +113,13 @@ class LineEditor:
 
         Raises KeyboardInterrupt on Ctrl-C so the caller's normal exit path
         handles it -- the UI has hardware to put back in a safe state, and
-        that must not be skipped.
+        that must not be skipped. Ctrl-E raises EmergencyStop, which the
+        caller acts on at once rather than at the end of a line.
         """
         lines: list[str] = []
         for ch in keys:
+            if ch == CTRL_E:
+                raise EmergencyStop
             if ch in (CTRL_C, CTRL_D):
                 raise KeyboardInterrupt
             if ch == ENTER:

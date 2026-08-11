@@ -29,6 +29,11 @@ from .protocol import NgsError
 
 #: Commands that act on the bench as a whole rather than one channel.
 GLOBAL_ALIASES: dict[str, str] = {
+    "!": "estop",
+    "E": "estop",
+    "ESTOP": "estop",
+    "EC": "estop_clear",
+    "CLEAR": "estop_clear",
     "S": "status",
     "STATUS": "status",
     "X": "stop",
@@ -391,6 +396,21 @@ def _cmd_status(bench: Bench) -> CommandResult:
     return CommandResult(True, "", show_status=True)
 
 
+def _cmd_estop(bench: Bench) -> CommandResult:
+    bench.estop()
+    return CommandResult(
+        True,
+        "*** EMERGENCY STOP ENGAGED *** outputs safe, latched. EC to clear.",
+    )
+
+
+def _cmd_estop_clear(bench: Bench) -> CommandResult:
+    bench.clear_estop()
+    return CommandResult(
+        True, "emergency stop cleared. Nothing moved -- outputs are still at their safe values."
+    )
+
+
 def _cmd_stop(bench: Bench) -> CommandResult:
     bench.stop()
     return CommandResult(True, "STOP: pump at default, valves closed")
@@ -410,6 +430,8 @@ def _cmd_help(bench: Bench) -> CommandResult:
 
 
 _GLOBALS: dict[str, Callable[[Bench], CommandResult]] = {
+    "estop": _cmd_estop,
+    "estop_clear": _cmd_estop_clear,
     "status": _cmd_status,
     "stop": _cmd_stop,
     "init": _cmd_init,
@@ -468,6 +490,8 @@ def help_text(bench: Bench) -> str:
         ]
 
     rows += [
+        ("! or E", "EMERGENCY STOP -- everything safe, latched (Ctrl-E too)"),
+        ("EC", "clear the emergency stop"),
         ("S", "device status"),
         ("X", "stop: pump to default, valves closed"),
         ("Z", "re-initialise the bench"),

@@ -84,6 +84,26 @@ that declaration, so there is no second copy to forget.
   `CCFLAGS` between gcc and g++, so C-only flags break the C++ build. Warnings
   are scoped in `build_src_flags` and `firmware/lib/ngs/library.json`.
 
+## The emergency stop
+
+Three properties, and each is load-bearing:
+
+- **Atomic on the device.** One message; the board walks its own safe-state
+  table. A host-side sequence of writes can half-succeed.
+- **Latched.** Output commands return `NGS_ERR_ESTOP` until cleared. Reads and
+  "return to manual" stay allowed.
+- **Independent of the host.** The watchdog latches when no frame arrives for
+  `watchdog_ms`. That is the case a host-side stop cannot cover.
+
+The safe-state table is registered by the host (`Bench.register_safe_state`)
+because the firmware does not know what a valve is. It is sent one entry per
+message so every payload stays a flat struct of scalars, which is what keeps
+the mirror verifiable field by field.
+
+The watchdog defaults to off. Think before changing that: always-on means a
+valve set from a one-shot command gets closed a few seconds later, which is
+ordinary bench use, not an emergency.
+
 ## The control loop
 
 `firmware/lib/ngs/ngs_control.c` runs the closed-loop pump control on the

@@ -25,7 +25,13 @@ from rich.text import Text
 from . import protocol as p
 from .bench import Bench, Snapshot, ValveReading
 from .commands import CommandResult, execute_line, help_text
-from .keyboard import LineEditor, raw_mode, read_keys, stdin_is_interactive
+from .keyboard import (
+    EmergencyStop,
+    LineEditor,
+    raw_mode,
+    read_keys,
+    stdin_is_interactive,
+)
 
 #: 2 Hz, as specified. Each poll is 4-5 round trips; USB CDC round trips are
 #: well under a millisecond, so this costs nothing and could go much faster.
@@ -134,6 +140,14 @@ def _valve_style(reading: ValveReading) -> str:
 def render_status(snapshot: Snapshot, *, port: str, fw: str, poll_hz: float) -> Text:
     """The one-line header: is the link healthy, and is the board the one we
     think it is."""
+    if snapshot.status is not None and snapshot.status.estopped:
+        why = snapshot.status.estop_source_name.lower()
+        return Text(
+            f"{port}  *** EMERGENCY STOP LATCHED ({why}) ***  "
+            "outputs are safe and will not move. EC to clear.",
+            style="bold white on red",
+        )
+
     if snapshot.error:
         return Text(f"{port}  LINK ERROR  {snapshot.error}", style="bold red")
 
@@ -178,6 +192,7 @@ def render(
         *[Text(line.text, style="" if line.ok else "red") for line in log[-LOG_LINES:]],
         Text(),
         Text.assemble(("> ", "bold cyan"), (prompt, "bold"), ("_", "dim")),
+        Text("Ctrl-E: EMERGENCY STOP", style="red"),
     )
     return Panel(body, title="NextGen Stand bench", subtitle="? for help, Q to quit")
 
@@ -222,6 +237,20 @@ class Dashboard:
         self.poll()
         return True
 
+    def emergency_stop(self) -> None:
+        """Ctrl-E. Engages at once -- no line to finish, no confirmation.
+
+        A confirmation prompt on an emergency stop is a contradiction: the
+        cost of an accidental stop is a re-enable, and the cost of a slow one
+        is whatever the pump was about to do.
+        """
+        try:
+            self.bench.estop()
+            self.log.append(LogLine("*** EMERGENCY STOP *** outputs safe, latched. EC to clear."))
+        except Exception as exc:  # noqa: BLE001 -- report anything, stop nothing
+            self.log.append(LogLine(f"EMERGENCY STOP FAILED: {exc}", ok=False))
+        self.poll()
+
     def _log_result(self, result: CommandResult) -> None:
         if result.show_status:
             status = self.snapshot.status
@@ -262,6 +291,8 @@ class Dashboard:
                     for line in self.editor.feed(read_keys()):
                         if not self.handle(line):
                             return
+                except EmergencyStop:
+                    self.emergency_stop()
                 except KeyboardInterrupt:
                     return
 

@@ -21,7 +21,7 @@ from typing import ClassVar
 # Constants
 # --------------------------------------------------------------------------
 
-PROTO_VERSION = 2
+PROTO_VERSION = 3
 MAX_PAYLOAD = 512
 
 #: OR'd onto a request type to form the response type.
@@ -41,6 +41,8 @@ class MsgType(IntEnum):
     GET_INFO = 0x02
     GET_STATUS = 0x03
     RESET = 0x04
+    ESTOP = 0x05
+    SET_SAFE_ENTRY = 0x06
 
     SET_GPIO = 0x10
     GET_GPIO = 0x11
@@ -76,6 +78,7 @@ class ErrCode(IntEnum):
     OVERFLOW = 0x06
     NOT_SUPPORTED = 0x07
     BUSY = 0x08
+    ESTOP = 0x09
 
 
 class PinMode(IntEnum):
@@ -229,6 +232,10 @@ class Status(Payload):
         ("uint32_t", "rx_overflows"),
         ("uint32_t", "loop_max_us"),
         ("int32_t", "temp_mc"),
+        ("uint8_t", "estop"),
+        ("uint8_t", "estop_source"),
+        ("uint8_t", "safe_entries"),
+        ("uint8_t", "_pad"),
     )
 
     uptime_us: int
@@ -238,10 +245,24 @@ class Status(Payload):
     rx_overflows: int
     loop_max_us: int
     temp_mc: int
+    estop: int = 0
+    estop_source: int = 0
+    safe_entries: int = 0
 
     @property
     def temp_c(self) -> float:
         return self.temp_mc / 1000.0
+
+    @property
+    def estopped(self) -> bool:
+        return bool(self.estop)
+
+    @property
+    def estop_source_name(self) -> str:
+        try:
+            return EstopSource(self.estop_source).name
+        except ValueError:
+            return f"0x{self.estop_source:02X}"
 
 
 @dataclass(slots=True)
@@ -364,6 +385,66 @@ class ErrorPayload(Payload):
     code: int
     seq: int = 0
     type: int = 0
+
+
+# --------------------------------------------------------------------------
+# Emergency stop
+# --------------------------------------------------------------------------
+
+
+class EstopAction(IntEnum):
+    CLEAR = 0x00
+    ENGAGE = 0x01
+
+
+class EstopSource(IntEnum):
+    """Why the device is latched."""
+
+    NONE = 0x00
+    COMMAND = 0x01
+    WATCHDOG = 0x02
+
+
+class SafeKind(IntEnum):
+    GPIO = 0x00
+    PWM = 0x01
+
+
+#: Index that clears the whole safe-state table instead of setting a slot.
+SAFE_INDEX_CLEAR = 0xFF
+SAFE_MAX_ENTRIES = 8
+
+
+@dataclass(slots=True)
+class EstopCmd(Payload):
+    C_NAME = "NgsEstopCmdPayload"
+    FIELDS = (
+        ("uint8_t", "action"),
+        ("uint8_t[3]", "_pad"),
+    )
+
+    action: int = EstopAction.ENGAGE
+
+
+@dataclass(slots=True)
+class SafeEntry(Payload):
+    C_NAME = "NgsSafeEntryPayload"
+    FIELDS = (
+        ("uint8_t", "index"),
+        ("uint8_t", "kind"),
+        ("uint8_t", "pin"),
+        ("uint8_t", "_pad"),
+        ("uint16_t", "value"),
+        ("uint16_t", "resolution"),
+        ("uint32_t", "watchdog_ms"),
+    )
+
+    index: int
+    kind: int = SafeKind.GPIO
+    pin: int = 0
+    value: int = 0
+    resolution: int = 0
+    watchdog_ms: int = 0
 
 
 # --------------------------------------------------------------------------
