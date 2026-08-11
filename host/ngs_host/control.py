@@ -30,6 +30,21 @@ def _clamp(value: float, lo: float, hi: float) -> float:
     return lo if value < lo else hi if value > hi else value
 
 
+def _apply_deadzone(cfg: p.ControlCfg, demand: float) -> float:
+    """Demand 0-100 mapped onto deadzone..100. See ngs_control.c."""
+    if cfg.out_deadzone <= 0.0 or demand <= 0.0:
+        return demand
+    return cfg.out_deadzone + demand * (100.0 - cfg.out_deadzone) / 100.0
+
+
+def _remove_deadzone(cfg: p.ControlCfg, duty: float) -> float:
+    if cfg.out_deadzone <= 0.0 or duty <= 0.0:
+        return duty
+    if duty <= cfg.out_deadzone:
+        return 0.0
+    return (duty - cfg.out_deadzone) * 100.0 / (100.0 - cfg.out_deadzone)
+
+
 def _slew(from_: float, to: float, max_step: float) -> float:
     """0 means no limit, not "never move" -- same convention as the C."""
     if max_step <= 0.0:
@@ -66,6 +81,11 @@ class _Autotune:
     peak_acc: float = 0.0
     trough_acc: float = 0.0
 
+    settle_us: int = 0
+    settle_min: float = 0.0
+    settle_max: float = 0.0
+    noise: float = 0.0
+
     ku: float = 0.0
     tu: float = 0.0
     measured_amplitude: float = 0.0
@@ -94,6 +114,7 @@ class FakeController:
         self.seed_setpoint = False
 
         self.setpoint_active = 0.0
+        self.demand = 0.0
         self.integral = 0.0
         self.last_measurement = 0.0
         self.output = 0.0
@@ -130,6 +151,8 @@ class FakeController:
             return p.ErrCode.BAD_ARGUMENT
         if cfg.filter_tau_s < 0.0 or cfg.deadband < 0.0:
             return p.ErrCode.BAD_ARGUMENT
+        if not 0.0 <= cfg.out_deadzone < 100.0:
+            return p.ErrCode.BAD_ARGUMENT
         if cfg.cal_scale == 0.0:
             return p.ErrCode.BAD_ARGUMENT
 
@@ -144,7 +167,8 @@ class FakeController:
         if cfg.mode == p.PumpMode.AUTO:
             if was != p.PumpMode.AUTO:
                 self.output = current_output
-                self.integral = current_output
+                self.demand = _remove_deadzone(cfg, current_output)
+                self.integral = self.demand
                 # NOT seeded from self.measurement here -- it is stale until the
                 # loop has ticked at least once. See seed_setpoint in
                 # ngs_control.h.
@@ -240,8 +264,9 @@ class FakeController:
         else:
             self.flags &= ~p.CtrlFlag.SATURATED
 
-        self.output = _slew(self.output, limited, cfg.output_slew * dt)
-        self.output = _clamp(self.output, cfg.out_min, cfg.out_max)
+        self.demand = _slew(self.demand, limited, cfg.output_slew * dt)
+        self.demand = _clamp(self.demand, cfg.out_min, cfg.out_max)
+        self.output = _apply_deadzone(cfg, self.demand)
         return self.output
 
     def tick(self, now_us: int, raw: int) -> float | None:
@@ -303,6 +328,8 @@ class FakeController:
             return p.ErrCode.BAD_ARGUMENT
         if cmd.timeout_ms < 1000:
             return p.ErrCode.BAD_ARGUMENT
+        if cmd.settle_ms > cmd.timeout_ms:
+            return p.ErrCode.BAD_ARGUMENT
 
         self.at = _Autotune(
             state=p.AutotuneState.SETTLING,
@@ -313,6 +340,9 @@ class FakeController:
             hysteresis=cmd.hysteresis,
             started_us=now_us,
             timeout_us=cmd.timeout_ms * 1000,
+            settle_us=(cmd.settle_ms or 2000) * 1000,
+            settle_min=self.measurement,
+            settle_max=self.measurement,
             relay_high=True,
             peak_acc=self.measurement,
             trough_acc=self.measurement,
@@ -367,8 +397,40 @@ class FakeController:
         at.state = p.AutotuneState.DONE
         at.fail_reason = p.AutotuneFail.NONE
 
+    def _autotune_settle(self, now_us: int) -> float:
+        """Hold the bias, let the process settle, measure the noise.
+
+        The measured wander is what sizes the relay band: guessing it is how
+        an autotune ends up switching on noise and confidently reporting the
+        period of its own sampling. See ngs_control.c.
+        """
+        at = self.at
+        m = self.measurement
+        at.settle_min = min(at.settle_min, m)
+        at.settle_max = max(at.settle_max, m)
+
+        self.demand = _clamp(at.bias, self.cfg.out_min, self.cfg.out_max)
+        self.output = _apply_deadzone(self.cfg, self.demand)
+
+        if now_us < at.started_us + at.settle_us:
+            return self.output
+
+        at.noise = at.settle_max - at.settle_min
+        if at.hysteresis <= 0.0:
+            at.hysteresis = 1.5 * at.noise or 0.5
+
+        at.relay_high = self.measurement < at.setpoint
+        at.peak_acc = m
+        at.trough_acc = m
+        at.last_cross_us = 0
+        at.state = p.AutotuneState.RELAY
+        return self.output
+
     def _autotune_tick(self, now_us: int) -> float:
         at = self.at
+
+        if at.state == p.AutotuneState.SETTLING:
+            return self._autotune_settle(now_us)
 
         if now_us >= at.started_us + at.timeout_us:
             self._autotune_finish()
@@ -409,7 +471,8 @@ class FakeController:
                 return self.output
 
         level = at.bias + at.amplitude if at.relay_high else at.bias - at.amplitude
-        self.output = _clamp(level, self.cfg.out_min, self.cfg.out_max)
+        self.demand = _clamp(level, self.cfg.out_min, self.cfg.out_max)
+        self.output = _apply_deadzone(self.cfg, self.demand)
         return self.output
 
     # -- reporting ---------------------------------------------------------
@@ -447,4 +510,6 @@ class FakeController:
             ki=at.ki,
             kd=at.kd,
             spread=at.spread,
+            noise=at.noise,
+            hysteresis=at.hysteresis,
         )

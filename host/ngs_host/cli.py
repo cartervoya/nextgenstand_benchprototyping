@@ -566,6 +566,78 @@ def gains(
 
 
 @app.command()
+def pumpcurve(
+    steps: Annotated[int, typer.Option(help="Drive levels to sample between 0 and 100 %.")] = 10,
+    dwell: Annotated[float, typer.Option(help="Seconds to hold each step before reading.")] = 4.0,
+    apply: Annotated[
+        bool, typer.Option("--apply", help="Write the measured deadzone to the board.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation.")] = False,
+    port: PortOpt = None,
+    sim: SimOpt = False,
+) -> None:
+    """Measure what the pump actually does across its range.
+
+    Steps the drive from 0 to 100 % and records the flow at each step, then
+    reports the deadzone (the drive below which nothing moves), how linear the
+    response is, and how much the gain varies between the bottom and the top.
+
+    Those three numbers are what decide whether a tuning done at one flow is
+    any good at another -- and the deadzone is worth applying, because the loop
+    can compensate for it exactly.
+
+    Runs the pump. The flow path must be open.
+    """
+    from .pumpcurve import measure
+
+    obj, _ = _open(port, sim)
+    with obj.device:
+        if not yes and not typer.confirm(
+            f"\nThis runs the pump from 0 to 100 % in {steps} steps "
+            f"(about {steps * (dwell + 0.5) / 60:.0f} min). Flow path open?"
+        ):
+            raise typer.Abort
+
+        table = Table("drive", "flow", "spread", box=None)
+
+        def show(point) -> None:
+            table.add_row(
+                f"{point.percent:5.0f} %",
+                f"{point.flow:8.1f}",
+                f"±{point.spread / 2:.1f}",
+            )
+
+        curve = measure(obj, steps=steps, dwell_s=dwell, on_point=show)
+        console.print(table)
+
+        if curve.aborted:
+            console.print(f"[red]stopped: {curve.aborted}[/red]")
+            raise typer.Exit(1)
+
+        console.print()
+        for line in curve.describe():
+            console.print(line)
+
+        if curve.deadzone <= 0:
+            console.print("\n[dim]No deadzone found; nothing to apply.[/dim]")
+            return
+
+        if not apply:
+            console.print(
+                f"\n[dim]Re-run with --apply to set out_deadzone to {curve.deadzone:.0f} % "
+                "on the board.[/dim]"
+            )
+            return
+
+        from dataclasses import replace
+
+        obj.set_control_cfg(replace(obj.control_cfg(), out_deadzone=curve.deadzone))
+        console.print(
+            f"\n[green]deadzone {curve.deadzone:.0f} % applied and saved to the board[/green]"
+        )
+
+
+@app.command()
 def tune(
     setpoint: Annotated[float, typer.Argument(help="Flow to oscillate around, mL/min.")],
     amplitude: Annotated[float, typer.Option(help="Relay step, % output.")] = 10.0,
@@ -582,11 +654,13 @@ def tune(
     port: PortOpt = None,
     sim: SimOpt = False,
 ) -> None:
-    """Autotune the flow loop by relay feedback.
+    """Autotune the flow loop by relay feedback, around a given flow.
 
-    The pump is driven up and down around `setpoint` on purpose until the flow
-    settles into a limit cycle; its amplitude and period give the ultimate gain
-    and period, and the tuning rule turns those into gains.
+    Tuning "at 240 mL/min" means exactly that: the experiment is run at that
+    operating point and the gains it produces describe the pump *there*. On a
+    pump whose gain varies across its range -- most of them -- a tuning done at
+    50 will be wrong at 400. Tune where you intend to run, and use
+    `ngs pumpcurve` to see how far that carries.
     """
     import time
 
@@ -600,10 +674,29 @@ def tune(
 
     obj, _ = _open(port, sim)
     with obj.device:
-        if not yes and not typer.confirm(
-            f"\nThis oscillates the pump around {setpoint:g} mL/min for up to "
-            f"{timeout:g}s. Flow path open and ready?"
-        ):
+        settle = 3.0  # matches AutotuneCmd.settle_ms
+        band = (
+            f"{hysteresis:g} mL/min"
+            if hysteresis
+            else "sized from the noise measured while settling"
+        )
+        console.print("[bold]what this will do[/bold]")
+        console.print(
+            f"  1. hold the pump steady for {settle:g}s and measure the flow signal's noise\n"
+            f"  2. switch the drive between +{amplitude:g} % and -{amplitude:g} % around its\n"
+            f"     current level every time the flow crosses {setpoint:g} mL/min, so the loop\n"
+            f"     oscillates on purpose. Switching band: {band}\n"
+            f"  3. average {cycles} full cycles to get the ultimate gain and period\n"
+            f"  4. turn those into gains with the {rule} rule\n"
+            f"  5. return the pump to manual and stop"
+        )
+        console.print(
+            f"  [dim]Gives up after {timeout:g}s. "
+            + ("Gains are applied and saved to the board." if adopt else "Gains are not applied.")
+            + "[/dim]"
+        )
+
+        if not yes and not typer.confirm("\nThe pump will oscillate. Flow path open and ready?"):
             raise typer.Abort
 
         obj.start_autotune(
@@ -647,12 +740,18 @@ def tune(
                 )
             if result.fail_reason == AutotuneFail.NO_SWING:
                 console.print(
-                    "[dim]The flow barely moved. Raise --amplitude, lower --hysteresis, "
-                    "or check the valves are actually open.[/dim]"
+                    f"[dim]The flow swing barely cleared the {result.hysteresis:.1f} mL/min "
+                    f"switching band, which was sized from {result.noise:.1f} mL/min of measured "
+                    "noise. Either the signal is too noisy to tune at this amplitude -- raise "
+                    "--amplitude so the process moves further than the noise -- or the pump is "
+                    "not reaching the flow path.[/dim]"
                 )
             raise typer.Exit(1)
 
         table = Table(box=None, show_header=False)
+        table.add_row("tuned at", f"{setpoint:g} mL/min")
+        table.add_row("measured noise", f"{result.noise:.1f} mL/min peak-to-peak")
+        table.add_row("switching band", f"{result.hysteresis:.1f} mL/min")
         table.add_row("cycles", str(result.cycles_done))
         table.add_row("ultimate gain Ku", f"{result.ku:.4g}")
         table.add_row("ultimate period Tu", f"{result.tu:.3g} s")
