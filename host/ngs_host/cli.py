@@ -42,10 +42,23 @@ def _open(port: str | None, sim: bool, timeout: float = 1.0) -> tuple[Bench, str
     """Open the bench and return it with a label for the display."""
     if sim:
         return Bench(Device(make_sim_device(), timeout=timeout)), "sim"
+    import serial
+
     try:
         device = Device.open(port, timeout=timeout)
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from None
+    except serial.SerialException as exc:
+        # Overwhelmingly this is "a dashboard already has it": Windows serial
+        # ports are exclusive. A stack trace teaches nobody that.
+        hint = (
+            "The port is already open. Only one process can hold a serial port, "
+            "so quit `ngs bench` or `ngs web` first."
+            if "Access is denied" in str(exc)
+            else "Is the board still plugged in?"
+        )
+        console.print(f"[red]cannot open the port:[/red] {exc}\n{hint}")
+        raise typer.Exit(1) from None
     # The resolved port, not "auto": which board you are actually talking to is
     # the whole point of the label once a second one shows up on the bench.
     return Bench(device), device.port or "?"
@@ -607,12 +620,23 @@ def tune(
 
 @app.command()
 def valve(
-    which: Annotated[str, typer.Argument(help="Valve code or name, e.g. V1 or valve1.")],
+    which: Annotated[
+        str, typer.Argument(help="Valve code or name (V1, valve1), or 'all'.")
+    ],
     action: Annotated[str, typer.Argument(help="open | close | toggle | read")],
     port: PortOpt = None,
     sim: SimOpt = False,
 ) -> None:
-    """Drive or read a valve."""
+    """Drive or read a valve, or every valve at once."""
+    if which.lower() == "all":
+        letter = {"open": "VO", "close": "VC"}.get(action.lower())
+        if letter is None:
+            raise typer.BadParameter("with 'all', the action must be open or close")
+        obj, _ = _open(port, sim)
+        with obj.device:
+            _run(obj, letter)
+        return
+
     codes = {v.code.upper(): v for v in BENCH_CONFIG.valves}
     names = {v.name.lower(): v for v in BENCH_CONFIG.valves}
     spec = codes.get(which.upper()) or names.get(which.lower())

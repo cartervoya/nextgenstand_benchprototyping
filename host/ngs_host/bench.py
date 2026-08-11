@@ -727,6 +727,35 @@ class Bench:
         self.device.set_gpio(spec.pin, spec.level_for(is_open), p.PinMode.OUTPUT)
         self._valve_commanded[spec.name] = is_open
 
+    def set_all_valves(self, is_open: bool) -> list[str]:
+        """Drive every valve the same way. Returns the names, in order.
+
+        Not atomic on the device -- that is what the emergency stop is for.
+        This is the ordinary convenience of not typing `V1O;V2O;`, and it fails
+        the same way any other command does if one of them is refused.
+        """
+        for spec in self.config.valves:
+            self.set_valve(spec.name, is_open)
+        return [spec.name for spec in self.config.valves]
+
+    def running_outputs(self) -> list[str]:
+        """PWM outputs that are not at zero right now, by description.
+
+        Used to warn before closing every valve: a pump driving into a closed
+        line is dead-heading, which is the one ordering mistake this codebase
+        keeps taking care to avoid.
+        """
+        running = []
+        for spec in self.config.pwms:
+            if any(c.output == spec.name for c in self.config.controls):
+                state = self.control_state()
+                if state.mode != p.PumpMode.MANUAL or state.output > 0.0:
+                    running.append(spec.description or spec.name)
+                    continue
+            elif self._pwm_percent.get(spec.name, 0.0) > 0.0:
+                running.append(spec.description or spec.name)
+        return running
+
     def toggle_valve(self, name: str) -> bool:
         """Flip the valve and return its new state."""
         spec = self._valve(name)

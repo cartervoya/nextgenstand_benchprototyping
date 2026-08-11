@@ -240,3 +240,86 @@ def test_longer_codes_win_so_v1_cannot_shadow_v10(board):
     execute_line(bench, "V10O")
     assert board.pin_values[3] == 1
     assert board.pin_values.get(2, 0) == 0
+
+
+# -- all valves at once ----------------------------------------------------
+
+
+def test_vo_opens_every_valve(bench, board):
+    (result,) = run(bench, "VO")
+    assert result.ok
+    assert board.pin_values[32] == 1
+    assert board.pin_values[31] == 1
+
+
+def test_vc_closes_every_valve(bench, board):
+    run(bench, "VO")
+    (result,) = run(bench, "VC")
+    assert result.ok
+    assert board.pin_values[32] == 0
+    assert board.pin_values[31] == 0
+
+
+def test_the_group_codes_do_not_shadow_the_individual_ones(bench, board):
+    """`V1O` and `V2C` must still resolve by channel code, not be swallowed by
+    the VO/VC exact matches."""
+    run(bench, "V1O")
+    assert board.pin_values[32] == 1
+    assert board.pin_values.get(31, 0) == 0
+
+    run(bench, "V2O;V1C")
+    assert board.pin_values[32] == 0
+    assert board.pin_values[31] == 1
+
+
+def test_long_forms(bench, board):
+    run(bench, "VOPEN")
+    assert board.pin_values[32] == 1
+    run(bench, "VCLOSE")
+    assert board.pin_values[32] == 0
+
+
+def test_closing_everything_warns_while_a_pump_is_running(bench):
+    """A pump driving into a closed line is dead-heading -- do what was asked,
+    but do not let it pass silently."""
+    run(bench, "VO;P40")
+    (result,) = run(bench, "VC")
+    assert result.ok
+    assert "WARNING" in result.text
+    assert "closed line" in result.text
+
+
+def test_no_warning_when_nothing_is_running(bench):
+    run(bench, "VO")
+    (result,) = run(bench, "VC")
+    assert result.ok
+    assert "WARNING" not in result.text
+
+
+def test_closing_everything_warns_while_the_loop_is_running(bench):
+    """In auto the duty is the loop's, not the cached manual value, so the
+    check has to ask the controller."""
+    run(bench, "VO;PA200")
+    (result,) = run(bench, "VC")
+    assert "WARNING" in result.text
+
+
+def test_the_group_commands_appear_in_help(bench):
+    assert "VO / VC" in help_text(bench)
+
+
+def test_a_single_valve_bench_does_not_advertise_the_group(board):
+    """One valve makes VO/VC pointless clutter in the help."""
+    config = BenchConfig(valves=(ValveSpec("only", "V1", 12, description="Only"),))
+    single = Bench(Device(FakeDevice(board)), config)
+    assert "VO / VC" not in help_text(single)
+    # They still work, they are just not advertised.
+    assert execute(single, "VO").ok
+    assert board.pin_values[12] == 1
+
+
+def test_they_are_refused_while_estopped(bench):
+    bench.estop()
+    (result,) = execute_line(bench, "VO")
+    assert not result.ok
+    assert "ESTOP" in result.text

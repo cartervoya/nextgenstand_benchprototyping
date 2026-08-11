@@ -167,6 +167,7 @@ rate drops rather than claiming 2 Hz over stale numbers.
 | Command | Effect |
 |---|---|
 | `V1O` `V1C` `V1T` `V1?` | valve 1 open / close / toggle / query |
+| `VO` `VC` | open / close **every** valve at once |
 | `P50` `P37.5` | pump duty, percent (manual mode) |
 | `P+5` `P-5` | nudge the duty |
 | `PA250` | closed loop: hold 250 mL/min |

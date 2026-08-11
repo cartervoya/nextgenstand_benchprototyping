@@ -4,6 +4,7 @@
     V1C;        close valve 1             P37.5;  pump to 37.5 %
     V1T;        toggle valve 1            P+5;    pump 5 % faster
     V1?;        query valve 1             P?;     query the pump setpoint
+    VO; VC;     all valves open/closed
     F?;         read the flow meter       X;      stop: everything safe
     S;          device status             Z;      re-initialise the bench
     ?;          help                      Q;      quit
@@ -29,6 +30,12 @@ from .protocol import NgsError
 
 #: Commands that act on the bench as a whole rather than one channel.
 GLOBAL_ALIASES: dict[str, str] = {
+    # Every valve at once. Exact matches, so they cannot shadow V1O/V2C --
+    # those are resolved later, by channel code.
+    "VO": "valves_open",
+    "VOPEN": "valves_open",
+    "VC": "valves_close",
+    "VCLOSE": "valves_close",
     "!": "estop",
     "E": "estop",
     "ESTOP": "estop",
@@ -396,6 +403,28 @@ def _cmd_status(bench: Bench) -> CommandResult:
     return CommandResult(True, "", show_status=True)
 
 
+def _cmd_valves_open(bench: Bench) -> CommandResult:
+    if not bench.config.valves:
+        raise CommandError("no valves are configured")
+    names = bench.set_all_valves(True)
+    return CommandResult(True, f"all valves OPEN ({len(names)})")
+
+
+def _cmd_valves_close(bench: Bench) -> CommandResult:
+    if not bench.config.valves:
+        raise CommandError("no valves are configured")
+
+    # Checked before closing, not after: if the answer changes the operator's
+    # mind, the warning is only useful while the line is still open.
+    running = bench.running_outputs()
+    names = bench.set_all_valves(False)
+
+    text = f"all valves CLOSED ({len(names)})"
+    if running:
+        text += f"  -- WARNING: {', '.join(running)} still running into a closed line"
+    return CommandResult(True, text)
+
+
 def _cmd_estop(bench: Bench) -> CommandResult:
     bench.estop()
     return CommandResult(
@@ -430,6 +459,8 @@ def _cmd_help(bench: Bench) -> CommandResult:
 
 
 _GLOBALS: dict[str, Callable[[Bench], CommandResult]] = {
+    "valves_open": _cmd_valves_open,
+    "valves_close": _cmd_valves_close,
     "estop": _cmd_estop,
     "estop_clear": _cmd_estop_clear,
     "status": _cmd_status,
@@ -454,6 +485,9 @@ def help_text(bench: Bench) -> str:
             f"{valve.code}O / {valve.code}C / {valve.code}T / {valve.code}?",
             f"open / close / toggle / query {valve.description} (pin {valve.pin})",
         ))
+    if len(bench.config.valves) > 1:
+        rows.append(("VO / VC", "open / close every valve at once"))
+
     for pwm in bench.config.pwms:
         rows.append((
             f"{pwm.code}<0-100> / {pwm.code}+<n> / {pwm.code}?",
