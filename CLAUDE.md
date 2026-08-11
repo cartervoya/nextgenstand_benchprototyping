@@ -84,26 +84,42 @@ that declaration, so there is no second copy to forget.
   `CCFLAGS` between gcc and g++, so C-only flags break the C++ build. Warnings
   are scoped in `build_src_flags` and `firmware/lib/ngs/library.json`.
 
-## Persisted tuning
+## Where the tuning lives
 
-`store.py` keeps gains in `tuning.json`, keyed by MCU serial, loaded by
-`Bench.load_tuning()` and saved automatically whenever they change. Every
-entry point loads it -- a tuning that only loads down some code paths is one
-you cannot trust to be in effect, and that is exactly how it shipped broken
-the first time.
+The board, in NVM (`ngs_store.c`), read back by the host with
+GET_CONTROL_CFG. It is the authority: gains only mean anything against a
+particular pump, line and flow meter, and the board is bolted to those.
 
-Only tuning is persisted, never mode or setpoint: a configuration file must
-not be able to start a pump, and operating the bench should not produce a
-diff. The calibration stays in BENCH_CONFIG; a stale copy in the store would
-silently override the real wiring.
+Stored with magic, version and CRC. Flash writes are not atomic and a brownout
+mid-write leaves a half-updated block; a config made of two different ones
+would look perfectly plausible without the check. Mode and setpoint are
+stripped on the way in, so a board can never power up already driving a pump.
+Writes are explicit -- it is flash, with a finite erase budget.
 
-Every failure mode -- missing, corrupt, wrong shape, unwritable -- ends in
-"carry on with the configured defaults". A bench tool that will not start
-because its preferences file is corrupt is worse than one that forgets a
-tuning.
+Only a *stored* config is adopted by the host. A board that was never saved to
+reports the firmware's generic defaults, and BENCH_CONFIG's are specific to
+this rig. The calibration is never taken from the device at all.
 
-`host/tests/conftest.py` points the store at a temp file for every test.
-Without it the suite writes into the operator's real bench configuration.
+`store.py` still writes `tuning.json`, but purely as a record: reviewable
+history, never read back as configuration. One authority.
+
+`host/tests/conftest.py` points that record at a temp file for every test.
+Without it the suite writes into the operator's bench configuration.
+
+## Live plots
+
+`history.py` is a preallocated ring; the browser keeps its own in `plot.js` and
+asks `/api/history?since=N` for what is new. Attaching pulls a min/max
+decimated overview -- fixed payload whatever is stored, and min/max rather than
+an average because averaging erases the excursions worth seeing.
+
+Traces come from BENCH_CONFIG via `traces_for`, so a new channel is plottable
+with no edit to the plotting code. Nothing loads from the network.
+
+If you touch this, the properties to preserve are: recording allocates nothing
+per sample, a caught-up client transfers nothing, and a decimation pass is
+bounded by bucket count rather than buffer size. `test_history.py` pins all
+three.
 
 ## The emergency stop
 

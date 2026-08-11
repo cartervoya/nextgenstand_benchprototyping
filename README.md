@@ -308,6 +308,25 @@ long after the error reverses.
 The derivative acts on the measurement, not the error, so a setpoint step
 produces no derivative kick.
 
+### Measure the pump first
+
+```powershell
+.\.venv\Scripts\ngs.exe pumpcurve --apply
+```
+
+Steps the drive from 0 to 100 % and records the flow at each step, then
+reports:
+
+- **deadzone** -- the drive below which nothing moves. `--apply` writes it to
+  the board, and the loop then maps its 0-100 % demand onto deadzone..100 % so
+  it never has to wind the integral across a dead band to find the pump.
+- **linearity** -- worst deviation from a straight line
+- **gain spread** -- the slope at the bottom of the range against the top
+
+The last two are reported, not corrected. How far a tuning travels across the
+range is a judgement call, and a number you can see beats a correction you
+cannot.
+
 ### Autotune
 
 ```powershell
@@ -317,8 +336,20 @@ produces no derivative kick.
 Relay feedback (Åström–Hägglund): the output is driven up and down around the
 setpoint until the flow settles into a limit cycle, whose amplitude and period
 give the ultimate gain and period directly — no process model needed, and the
-loop is never deliberately pushed unstable. The hysteresis band keeps the relay
-switching on the process rather than on sensor noise.
+loop is never deliberately pushed unstable.
+
+**The switching band is measured, not guessed.** The run starts by holding the
+drive steady for a few seconds and watching how far the reading wanders on its
+own; that is the noise floor, and the band is sized at 1.5× it. On a noisy
+4-20 mA flow signal a guessed band is how a relay autotune ends up switching on
+noise and confidently reporting the period of its own sampling. Both the
+measured noise and the band used are reported.
+
+`ngs tune 240` prints what it is about to do, step by step, before asking to
+proceed — and tuning "at 240" means exactly that: the gains describe the pump
+*at that operating point*. On a pump whose gain varies across its range, a
+tuning done at 50 will be wrong at 400. Tune where you intend to run, and use
+`ngs pumpcurve` to see how far that carries.
 
 Gains come from **Tyreus–Luyben** by default, which is markedly less aggressive
 than Ziegler–Nichols (`--rule ziegler-nichols`, or `pessen` for faster and less
@@ -335,33 +366,74 @@ uncertain gain, they give a confidently enormous one, because Ku divides by
 the command aborts the experiment and stops the pump if it exits for any
 reason.
 
-### Tuning is saved
+### Live plots
 
-Gains, filter and deadband persist in `tuning.json` at the repo root, keyed by
-the board's MCU serial. They load automatically on every connect, so an
-autotune survives closing the terminal — and a second Teensy on the bench does
-not inherit the first one's tuning.
+`ngs web` records every poll and plots it. Any channel in `BENCH_CONFIG` is a
+trace -- flow, setpoint, error, the P and I terms, pump output, both valves --
+each a checkbox, flow and percent on separate axes so one does not flatten the
+other.
+
+The window runs from 30 seconds to everything held. Each axis auto-scales over
+what is *visible*, so a spike an hour ago does not flatten the last minute, or
+takes a manual range (both ends: half a manual range would mean the plot is
+lying about what you asked for).
+
+It is built to stay smooth with a large buffer, which mostly meant not doing
+work:
+
+- a preallocated ring on both sides, so recording never allocates and memory
+  is decided at startup rather than by uptime
+- the browser asks for "everything after sequence N", so a 4 Hz poll transfers
+  the four samples that are new, not the hundred thousand it already has
+- attaching pulls a min/max decimated overview: a fixed-size payload whatever
+  is stored. Min and max rather than an average, because averaging erases the
+  excursions you are watching a noisy signal to see
+- canvas, one path per trace, sub-pixel steps skipped -- a charting library
+  builds a DOM node per point and gives up around ten thousand
+
+Measured on the bench: an incremental fetch is about 2 ms. Nothing loads from
+the network, so it works on a bench with no internet.
+
+A faulted or missing reading records as a gap and breaks the line. Drawing
+through it would show a flow that was never measured.
+
+### Tuning lives on the board
+
+Gains, filter, deadband and deadzone are stored in the Teensy's own
+non-volatile memory -- 4284 bytes of wear-levelled program flash, of which a
+config uses 68. The host reads them back on connect rather than assuming them.
+
+That means a fresh checkout, a different laptop, or no host config at all still
+drives the rig with the gains it was actually set up with. Gains only mean
+anything against a particular pump, line and flow meter, and the board is the
+thing bolted to those.
 
 ```powershell
-.\.venv\Scripts\ngs.exe gains                  # show them, and where they came from
-.\.venv\Scripts\ngs.exe gains --kp 0.16        # set and save
-.\.venv\Scripts\ngs.exe gains --reset          # discard, back to BENCH_CONFIG
+.\.venv\Scripts\ngs.exe gains                  # show them, and whether they came from the board
+.\.venv\Scripts\ngs.exe gains --kp 0.16        # set, and save to the board
+.\.venv\Scripts\ngs.exe gains --reset          # erase the board's copy, back to BENCH_CONFIG
 ```
 
-The file is meant to be committed: it diffs, so "kp went from 0.16 to 0.31 on
-the 12th, from an autotune with Ku 0.52" is a question git can answer. An
-autotune records what it measured alongside the gains it produced.
+Stored with a CRC and a version. Flash writes are not atomic, so a brownout
+part way through leaves a half-updated block; without the check the loop would
+come up with a plausible-looking configuration made of two different ones,
+which is worse than coming up with none. A config written by a firmware with a
+different layout is ignored rather than reinterpreted.
 
-Setpoint and mode are deliberately *not* saved. Restoring those would mean
-opening a terminal could start the pump, which is not something a
-configuration file should be able to do — and it keeps the file quiet while
-you work, so running the bench produces no diff.
+Mode and setpoint are never stored. A board that powered up already driving a
+pump, because that is what it was doing when it was saved, is not something
+this bench should be able to do.
 
-It lives on the host rather than in the board's EEPROM because tuning is bench
-configuration, and in this project that lives under version control next to
-the calibration it depends on. Gains are only meaningful against a particular
-pump, line and flow meter. If you ever want the board to hold its own gains so
-it can run standalone, that is a firmware change and worth asking for.
+Writing is explicit, never automatic on every keystroke: it is flash, with a
+finite erase budget.
+
+`tuning.json` is still written, demoted to a record -- reviewable history,
+never read back as configuration. One authority, but "kp changed on the 12th,
+from an autotune with Ku 0.52" stays a question git can answer.
+
+The calibration is *not* stored on the board. It describes the wiring, it
+lives in `BENCH_CONFIG`, and a stale stored copy would silently rescale every
+reading.
 
 ### If the sensor dies mid-run
 
