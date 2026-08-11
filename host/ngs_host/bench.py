@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, replace
 
 from . import protocol as p
 from .device import Device
+from .store import TuningRecord, TuningStore, apply_record
 
 # --------------------------------------------------------------------------
 # Board facts
@@ -414,9 +415,19 @@ class Bench:
     host still thinks they are open, which is exactly the failure worth seeing.
     """
 
-    def __init__(self, device: Device, config: BenchConfig = BENCH_CONFIG) -> None:
+    def __init__(
+        self,
+        device: Device,
+        config: BenchConfig = BENCH_CONFIG,
+        store: TuningStore | None = None,
+    ) -> None:
         self.device = device
         self.config = config
+        #: Where tuning is persisted. Pass a store to relocate it; the default
+        #: is the repo's tuning.json.
+        self.store = store if store is not None else TuningStore()
+        self._serial: str | None = None
+        self._loaded_tuning: TuningRecord | None = None
         self._pwm_percent: dict[str, float] = {s.name: s.default_percent for s in config.pwms}
         # What we last commanded, so a readback that disagrees can be flagged
         # rather than silently believed.
@@ -428,6 +439,65 @@ class Bench:
         self._control_cfg: dict[str, p.ControlCfg] = {
             spec.output: self._initial_control_cfg(spec) for spec in config.controls
         }
+
+    # -- persisted tuning ---------------------------------------------------
+
+    def board_serial(self) -> str:
+        """The MCU serial, cached. Identifies the rig a tuning belongs to."""
+        if self._serial is None:
+            self._serial = self.device.info().serial_hex
+        return self._serial
+
+    def load_tuning(self) -> TuningRecord | None:
+        """Apply this board's saved tuning over the configured defaults.
+
+        Idempotent, and safe to call on every entry point -- which is what it
+        does, because a tuning that only loads down one code path is a tuning
+        you cannot trust to be in effect.
+        """
+        record = self.store.load(self.board_serial())
+        if record is None:
+            return None
+
+        for name, cfg in self._control_cfg.items():
+            self._control_cfg[name] = apply_record(cfg, record)
+        self._loaded_tuning = record
+        return record
+
+    def save_tuning(
+        self,
+        output: str = "pump",
+        *,
+        source: str = "manual",
+        result: p.AutotuneResult | None = None,
+    ) -> None:
+        """Persist the current tuning for this board.
+
+        Called automatically whenever the gains change, so a tuning is never
+        lost to closing a terminal -- the failure mode that makes people stop
+        bothering to tune properly.
+        """
+        self.store.save(
+            self.board_serial(),
+            self.control_cfg(output),
+            source=source,
+            ku=None if result is None else result.ku,
+            tu=None if result is None else result.tu,
+            spread=None if result is None else result.spread,
+        )
+
+    @property
+    def loaded_tuning(self) -> TuningRecord | None:
+        """The record applied by `load_tuning`, for a UI to show provenance."""
+        return self._loaded_tuning
+
+    def forget_tuning(self) -> bool:
+        """Discard the saved tuning and go back to the configured defaults."""
+        dropped = self.store.forget(self.board_serial())
+        self._loaded_tuning = None
+        for spec in self.config.controls:
+            self._control_cfg[spec.output] = self._initial_control_cfg(spec)
+        return dropped
 
     # -- control configuration ---------------------------------------------
 
@@ -498,6 +568,7 @@ class Bench:
         self._control_cfg[spec.output] = cfg
         if cfg.mode == p.PumpMode.AUTO:
             self.device.set_control(cfg)
+        self.save_tuning(spec.output)
 
     def set_gains(
         self,
@@ -609,6 +680,9 @@ class Bench:
         if result.state != p.AutotuneState.DONE:
             raise ValueError(f"autotune did not finish cleanly ({result.state_name})")
         self.set_gains(result.kp, result.ki, result.kd, output=output)
+        # Re-saved with the experiment's own numbers attached, so a suspicious
+        # set of gains can be traced back to the run that produced them.
+        self.save_tuning(output, source="autotune", result=result)
         return result
 
     # -- setup -------------------------------------------------------------
@@ -620,6 +694,10 @@ class Bench:
         Safe to call on an already-running bench -- it is also how you recover
         after the board resets underneath you.
         """
+        # Saved tuning first: everything below configures the device, and it
+        # should be configured with the gains this rig was actually tuned to.
+        self.load_tuning()
+
         # Register where every output belongs in an emergency before driving
         # anything, so the device can get there without us from this point on.
         self.register_safe_state(watchdog_ms)

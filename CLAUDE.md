@@ -84,6 +84,27 @@ that declaration, so there is no second copy to forget.
   `CCFLAGS` between gcc and g++, so C-only flags break the C++ build. Warnings
   are scoped in `build_src_flags` and `firmware/lib/ngs/library.json`.
 
+## Persisted tuning
+
+`store.py` keeps gains in `tuning.json`, keyed by MCU serial, loaded by
+`Bench.load_tuning()` and saved automatically whenever they change. Every
+entry point loads it -- a tuning that only loads down some code paths is one
+you cannot trust to be in effect, and that is exactly how it shipped broken
+the first time.
+
+Only tuning is persisted, never mode or setpoint: a configuration file must
+not be able to start a pump, and operating the bench should not produce a
+diff. The calibration stays in BENCH_CONFIG; a stale copy in the store would
+silently override the real wiring.
+
+Every failure mode -- missing, corrupt, wrong shape, unwritable -- ends in
+"carry on with the configured defaults". A bench tool that will not start
+because its preferences file is corrupt is worse than one that forgets a
+tuning.
+
+`host/tests/conftest.py` points the store at a temp file for every test.
+Without it the suite writes into the operator's real bench configuration.
+
 ## The emergency stop
 
 Three properties, and each is load-bearing:

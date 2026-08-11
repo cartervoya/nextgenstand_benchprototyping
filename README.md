@@ -337,6 +337,37 @@ uncertain gain, they give a confidently enormous one, because Ku divides by
 the command aborts the experiment and stops the pump if it exits for any
 reason.
 
+### Tuning is saved
+
+Gains, filter and deadband persist in `tuning.json` at the repo root, keyed by
+the board's MCU serial. They load automatically on every connect, so an
+autotune survives closing the terminal — and a second Teensy on the bench does
+not inherit the first one's tuning.
+
+```powershell
+.\.venv\Scripts
+gs.exe gains                  # show them, and where they came from
+.\.venv\Scripts
+gs.exe gains --kp 0.16        # set and save
+.\.venv\Scripts
+gs.exe gains --reset          # discard, back to BENCH_CONFIG
+```
+
+The file is meant to be committed: it diffs, so "kp went from 0.16 to 0.31 on
+the 12th, from an autotune with Ku 0.52" is a question git can answer. An
+autotune records what it measured alongside the gains it produced.
+
+Setpoint and mode are deliberately *not* saved. Restoring those would mean
+opening a terminal could start the pump, which is not something a
+configuration file should be able to do — and it keeps the file quiet while
+you work, so running the bench produces no diff.
+
+It lives on the host rather than in the board's EEPROM because tuning is bench
+configuration, and in this project that lives under version control next to
+the calibration it depends on. Gains are only meaningful against a particular
+pump, line and flow meter. If you ever want the board to hold its own gains so
+it can run standalone, that is a firmware change and worth asking for.
+
 ### If the sensor dies mid-run
 
 A reading below `fault_below` (default −25 mL/min, i.e. under 4 mA) means the

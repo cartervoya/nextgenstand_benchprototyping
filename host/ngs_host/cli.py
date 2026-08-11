@@ -38,10 +38,20 @@ SimOpt = Annotated[bool, typer.Option("--sim", help="Use the simulator instead o
 TimeoutOpt = Annotated[float, typer.Option("--timeout", help="Per-command timeout, seconds.")]
 
 
+def _with_tuning(bench: Bench) -> Bench:
+    """Apply this board's saved tuning.
+
+    Every path into the bench goes through here, because a tuning that only
+    loads down some code paths is one you cannot trust to be in effect.
+    """
+    bench.load_tuning()
+    return bench
+
+
 def _open(port: str | None, sim: bool, timeout: float = 1.0) -> tuple[Bench, str]:
     """Open the bench and return it with a label for the display."""
     if sim:
-        return Bench(Device(make_sim_device(), timeout=timeout)), "sim"
+        return _with_tuning(Bench(Device(make_sim_device(), timeout=timeout))), "sim"
     import serial
 
     try:
@@ -61,7 +71,7 @@ def _open(port: str | None, sim: bool, timeout: float = 1.0) -> tuple[Bench, str
         raise typer.Exit(1) from None
     # The resolved port, not "auto": which board you are actually talking to is
     # the whole point of the label once a second one shows up on the bench.
-    return Bench(device), device.port or "?"
+    return _with_tuning(Bench(device)), device.port or "?"
 
 
 def _run(bench: Bench, line: str) -> None:
@@ -493,17 +503,41 @@ def gains(
     kp: Annotated[float | None, typer.Option(help="Proportional gain, % per mL/min.")] = None,
     ki: Annotated[float | None, typer.Option(help="Integral gain, % per mL/min-second.")] = None,
     kd: Annotated[float | None, typer.Option(help="Derivative gain. 0 on a noisy signal.")] = None,
+    reset: Annotated[
+        bool, typer.Option("--reset", help="Discard the saved tuning, back to config defaults.")
+    ] = False,
     port: PortOpt = None,
     sim: SimOpt = False,
 ) -> None:
-    """Show or set the controller gains."""
+    """Show or set the controller gains.
+
+    Changes are saved per board and reloaded automatically, so a tuning
+    survives closing the terminal.
+    """
     obj, _ = _open(port, sim)
     with obj.device:
+        if reset:
+            dropped = obj.forget_tuning()
+            cfg = obj.control_cfg()
+            console.print(
+                ("discarded the saved tuning; " if dropped else "nothing was saved; ")
+                + f"defaults are kp {cfg.kp:g}  ki {cfg.ki:g}  kd {cfg.kd:g}"
+            )
+            return
+
         if kp is None and ki is None and kd is None:
             _run(obj, "K?")
+            record = obj.loaded_tuning
+            if record is None:
+                console.print("[dim]nothing saved for this board -- using config defaults[/dim]")
+            else:
+                console.print(f"[dim]saved {record.source} {record.updated}[/dim]")
+            console.print(f"[dim]{obj.store.path}[/dim]")
             return
+
         cfg = obj.set_gains(kp, ki, kd)
         console.print(f"kp {cfg.kp:g}  ki {cfg.ki:g}  kd {cfg.kd:g}")
+        console.print(f"[dim]saved to {obj.store.path}[/dim]")
 
 
 @app.command()
@@ -613,7 +647,8 @@ def tune(
 
         if adopt:
             obj.adopt_autotune()
-            console.print("\n[green]gains applied[/green]")
+            console.print("\n[green]gains applied and saved[/green]")
+            console.print(f"[dim]{obj.store.path}[/dim]")
         else:
             console.print("\n[dim]Not applied. Re-run with --adopt, or send TA.[/dim]")
 
