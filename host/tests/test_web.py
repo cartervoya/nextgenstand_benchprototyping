@@ -152,3 +152,79 @@ def test_it_listens_on_localhost_only(web):
         assert httpd.server_address[0] == "127.0.0.1"
     finally:
         httpd.server_close()
+
+
+# -- live plotting ---------------------------------------------------------
+
+
+def test_polling_the_state_records_a_sample(web):
+    """One poll feeds both the readouts and the plot: the trace is exactly
+    what was displayed, and the bench is not asked twice."""
+    before = web.history.count
+    web.state()
+    assert web.history.count == before + 1
+
+
+def test_traces_are_offered_to_the_page(web):
+    keys = {t["key"] for t in web.traces()}
+    assert {"flow", "pump_output", "pump_setpoint"} <= keys
+    assert all({"key", "label", "unit", "axis", "color"} <= set(t) for t in web.traces())
+
+
+def test_history_is_served_incrementally(server):
+    for _ in range(6):
+        urllib.request.urlopen(f"{server}/api/state", timeout=5).read()
+
+    first = json.loads(urllib.request.urlopen(f"{server}/api/history?since=0", timeout=5).read())
+    assert len(first["t"]) >= 6
+
+    again = json.loads(
+        urllib.request.urlopen(f"{server}/api/history?since={first['seq']}", timeout=5).read()
+    )
+    assert again["t"] == [], "a caught-up client must not re-download the history"
+
+
+def test_the_overview_is_fixed_size_whatever_is_stored(server, web):
+    for _ in range(50):
+        web.state()
+
+    data = json.loads(
+        urllib.request.urlopen(f"{server}/api/history?mode=overview&buckets=8", timeout=5).read()
+    )
+    assert len(data["t"]) == 8
+    assert data["decimated"] is True
+    # min/max pairs, so a spike inside a bucket survives
+    assert all(len(pair) == 2 for pair in data["series"]["flow"])
+
+
+def test_a_client_can_ask_for_only_the_traces_it_draws(server, web):
+    web.state()
+    data = json.loads(
+        urllib.request.urlopen(f"{server}/api/history?since=0&keys=flow", timeout=5).read()
+    )
+    assert list(data["series"]) == ["flow"]
+
+
+def test_the_plotting_code_is_served_locally(server):
+    """A bench tool that needs a CDN to draw a graph does not work on a bench
+    with no internet, which is most of them."""
+    with urllib.request.urlopen(f"{server}/plot.js", timeout=5) as r:
+        js = r.read().decode()
+    assert r.headers["Content-Type"].startswith("application/javascript")
+    assert "class Ring" in js and "class Plot" in js
+
+
+def test_the_page_carries_no_external_references(server):
+    with urllib.request.urlopen(f"{server}/", timeout=5) as r:
+        body = r.read().decode()
+    for marker in ("http://", "https://", "cdn."):
+        assert marker not in body.replace("http://127.0.0.1", ""), f"external reference: {marker}"
+
+
+def test_a_faulted_reading_becomes_a_gap_not_a_number(web, board):
+    """Plotting a fault as a value would draw a flow that was never measured."""
+    board.adc = lambda channel: 0
+    web.state()
+
+    data = web.history.since(0, keys=["flow"])
+    assert data["series"]["flow"][-1] is None

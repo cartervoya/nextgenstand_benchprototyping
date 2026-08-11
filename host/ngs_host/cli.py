@@ -20,7 +20,7 @@ from rich.table import Table
 
 from .bench import BENCH_CONFIG, Bench, EstopLatched
 from .commands import execute_line
-from .device import Device, find_ports
+from .device import Device, Timeout, find_ports
 from .keyboard import stdin_is_interactive
 from .protocol import AutotuneFail, AutotuneState, MsgType, TuningRule
 from .sim import make_sim_device
@@ -58,6 +58,11 @@ def _open(port: str | None, sim: bool, timeout: float = 1.0) -> tuple[Bench, str
         device = Device.open(port, timeout=timeout)
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from None
+    except Timeout as exc:
+        # Almost always the Unity test binary left on the board by `pio test`,
+        # which speaks no protocol at all. A traceback teaches nobody that.
+        console.print(f"[red]the board is not answering:[/red] {exc}")
+        raise typer.Exit(1) from None
     except serial.SerialException as exc:
         # Overwhelmingly this is "a dashboard already has it": Windows serial
         # ports are exclusive. A stack trace teaches nobody that.
